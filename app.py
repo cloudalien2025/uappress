@@ -140,6 +140,34 @@ def wav_to_mp3(wav_path: str, mp3_path: str) -> None:
     ]
     run_ffmpeg(cmd)
 
+def extract_json_object(text: str) -> dict:
+    """
+    Robustly extract a JSON object from a model response.
+    Handles:
+      - pure JSON
+      - ```json ... ```
+      - extra commentary around JSON
+    """
+    text = text.strip()
+
+    # 1) If fenced code block exists, pull the inside
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    if m:
+        text = m.group(1).strip()
+
+    # 2) Try direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 3) Fallback: grab the first {...} block (best-effort)
+    m2 = re.search(r"(\{.*\})", text, re.S)
+    if not m2:
+        raise ValueError("Could not find JSON object in response.")
+    return json.loads(m2.group(1))
+
+
 def generate_outline(topic, total_minutes, chapter_minutes, global_style, episode_notes):
     chapters = max(6, total_minutes // chapter_minutes)
     prompt = f"""
@@ -159,16 +187,52 @@ Each chapter must include:
 - target_minutes
 - 5–7 bullet beats
 
-Return ONLY valid JSON:
-{{"chapters":[{{"title":"","target_minutes":10,"beats":[""]}}]}}
+Return ONLY valid JSON with this exact shape:
+{{
+  "chapters": [
+    {{
+      "title": "string",
+      "target_minutes": 10,
+      "beats": ["string", "string"]
+    }}
+  ]
+}}
 """
     r = client.chat.completions.create(
         model=SCRIPT_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.4
+        temperature=0.3
     )
-    content = r.choices[0].message.content.strip()
-    return json.loads(content)["chapters"]
+
+    content = (r.choices[0].message.content or "").strip()
+    data = extract_json_object(content)
+
+    chapters_list = data.get("chapters")
+    if not isinstance(chapters_list, list) or not chapters_list:
+        raise ValueError("Outline JSON missing 'chapters' list.")
+
+    # Normalize fields to avoid downstream KeyErrors
+    normalized = []
+    for ch in chapters_list:
+        title = str(ch.get("title", "")).strip() or "Untitled Chapter"
+        target = ch.get("target_minutes", chapter_minutes)
+        try:
+            target = int(target)
+        except Exception:
+            target = int(chapter_minutes)
+
+        beats = ch.get("beats", [])
+        if not isinstance(beats, list):
+            beats = []
+        beats = [str(b).strip() for b in beats if str(b).strip()]
+
+        normalized.append({
+            "title": title,
+            "target_minutes": target,
+            "beats": beats[:8]  # keep it tidy
+        })
+
+    return normalized
 
 def generate_chapter_script(topic, chapter, global_style, episode_notes):
     words = int(chapter["target_minutes"] * 140)
