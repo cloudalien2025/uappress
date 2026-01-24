@@ -146,11 +146,11 @@ def json_outline_from_model(prompt: str) -> dict:
         return extract_json_object(content2)
 
 def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
-    # concat demuxer list file
+    # ffmpeg concat demuxer list file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for wp in wav_paths:
-            # ffmpeg concat wants: file '/path'
-            f.write(f"file '{wp.replace(\"'\", \"'\\\\''\")}'\n")
+            # Safest: escape only single-quotes for ffmpeg concat list syntax
+            f.write("file '{}'\n".format(wp.replace("'", "'\\''")))
         list_path = f.name
 
     try:
