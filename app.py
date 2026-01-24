@@ -143,31 +143,27 @@ def json_outline_from_model(prompt: str) -> dict:
         content2 = safe_chat(stricter, temperature=0.15, tries=2)
         return extract_json_object(content2)
 
-def concat_audio_reencode(audio_paths: List[str], out_wav: str) -> None:
-    """
-    Robust concat that re-encodes to a consistent PCM format.
-    Fixes boundary glitches caused by concat demuxer + -c copy.
-    """
-    if not audio_paths:
-        raise ValueError("No audio paths provided.")
+def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
+    # ffmpeg concat demuxer list file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        for wp in wav_paths:
+            f.write("file '{}'\n".format(wp.replace("'", "'\\''")))
+        list_path = f.name
 
-    cmd = [FFMPEG, "-y"]
-    for p in audio_paths:
-        cmd += ["-i", p]
-
-    n = len(audio_paths)
-    filter_complex = f"concat=n={n}:v=0:a=1[aout]"
-
-    cmd += [
-        "-filter_complex", filter_complex,
-        "-map", "[aout]",
-        "-ar", "44100",
-        "-ac", "2",
-        "-c:a", "pcm_s16le",
-        out_wav,
-    ]
-    run_ffmpeg(cmd)
-pass
+    try:
+        cmd = [
+            FFMPEG, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
+            out_wav,
+        ]
+        run_ffmpeg(cmd)
+    finally:
+        try:
+            os.remove(list_path)
+        except Exception:
+            pass
 
 def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
     cmd = [
