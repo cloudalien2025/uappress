@@ -5,7 +5,7 @@ import json
 import zipfile
 import tempfile
 import subprocess
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Tuple
 
 import streamlit as st
 from openai import OpenAI
@@ -18,7 +18,7 @@ st.set_page_config(page_title="UAPpress Documentary Studio", layout="wide")
 st.title("🛸 UAPpress — Documentary TTS Studio (MVP)")
 st.caption(
     "Generate an Intro + chaptered documentary script + Outro, then create Onyx narration "
-    "with looped ambient music + fades. Export chapter MP3s + full episode MP3."
+    "with looped ambient music + fades. Export section MP3s + full episode MP3."
 )
 
 # ----------------------------
@@ -41,7 +41,7 @@ DEFAULT_MUSIC_PATH = "/mnt/data/dark-ambient-soundscape-music-409350.mp3"
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ----------------------------
-# Sponsor + Engagement (used in prompts)
+# Sponsor + Engagement (verbatim reads used in prompts)
 # ----------------------------
 SPONSOR_READ_INTRO = (
     "This documentary is sponsored by OPA Nutrition — a wellness company focused on clarity, "
@@ -104,7 +104,6 @@ def run_ffmpeg(cmd: List[str]) -> None:
 
 
 def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
-    # ffmpeg concat demuxer needs a file list
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for wp in wav_paths:
             safe_wp = wp.replace("'", "'\\''")
@@ -199,18 +198,15 @@ def extract_json_object(text: str) -> dict:
     """
     text = (text or "").strip()
 
-    # 1) fenced block
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
     if m:
         text = m.group(1).strip()
 
-    # 2) direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # 3) fallback first {...}
     m2 = re.search(r"(\{.*\})", text, re.S)
     if not m2:
         raise ValueError("Could not find JSON object in response.")
@@ -275,9 +271,7 @@ Return ONLY valid JSON with this exact shape:
             beats = []
         beats = [str(b).strip() for b in beats if str(b).strip()]
 
-        normalized.append(
-            {"title": title, "target_minutes": target, "beats": beats[:8]}
-        )
+        normalized.append({"title": title, "target_minutes": target, "beats": beats[:8]})
 
     return normalized
 
@@ -412,17 +406,12 @@ def tts_to_wav(text: str, instructions: str, speed: float, out_wav: str) -> None
 # ----------------------------
 # Session state
 # ----------------------------
-if "outline" not in st.session_state:
-    st.session_state.outline = None
-if "scripts" not in st.session_state:
-    st.session_state.scripts = {}  # chapter idx -> text
-if "intro" not in st.session_state:
-    st.session_state.intro = ""
-if "outro" not in st.session_state:
-    st.session_state.outro = ""
-if "built" not in st.session_state:
-    st.session_state.built = None  # dict with zip bytes, full mp3 bytes, etc.
+st.session_state.setdefault("outline", None)
+st.session_state.setdefault("built", None)
 
+# Widget keys are the single source of truth (IMPORTANT)
+st.session_state.setdefault("intro_text", "")
+st.session_state.setdefault("outro_text", "")
 
 # ----------------------------
 # UI — Episode setup
@@ -459,13 +448,24 @@ episode_notes = st.text_area(
 )
 
 if st.button("Generate Chapter Outline", type="primary"):
-    st.session_state.outline = generate_outline(
-        topic, total_minutes, chapter_minutes, global_style, episode_notes
-    )
-    st.session_state.scripts = {}
-    st.session_state.intro = ""
-    st.session_state.outro = ""
-    st.session_state.built = None
+    try:
+        st.session_state.outline = generate_outline(
+            topic, total_minutes, chapter_minutes, global_style, episode_notes
+        )
+        st.session_state.built = None
+
+        # reset scripts when outline changes
+        st.session_state["intro_text"] = ""
+        st.session_state["outro_text"] = ""
+        for i in range(1, 201):
+            k = f"chapter_text_{i}"
+            if k in st.session_state:
+                st.session_state[k] = ""
+
+        st.success("Outline generated.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Outline generation failed: {e}")
 
 if st.session_state.outline:
     st.subheader("📑 Outline")
@@ -487,43 +487,39 @@ else:
     c1, c2 = st.columns([1, 3], gap="large")
     with c1:
         if st.button("Generate Intro"):
-            with st.spinner("Writing intro..."):
-                st.session_state.intro = generate_intro(topic, global_style, episode_notes)
-            st.success("Intro generated.")
+            try:
+                with st.spinner("Writing intro..."):
+                    st.session_state["intro_text"] = generate_intro(topic, global_style, episode_notes)
+                st.success("Intro generated.")
+                st.session_state.built = None
+                st.rerun()
+            except Exception as e:
+                st.error(f"Intro generation failed: {e}")
 
     with c2:
-        st.session_state.intro = st.text_area(
-            "Intro text",
-            value=st.session_state.intro,
-            height=220,
-            key="intro_text",
-        )
+        st.text_area("Intro text", key="intro_text", height=220)
 
     # Chapters
     st.subheader("Chapters")
 
     if st.button("Generate All Chapters"):
-        with st.spinner("Writing chapter scripts..."):
-            for i, ch in enumerate(st.session_state.outline, 1):
-                st.session_state.scripts[i] = generate_chapter_script(
-                    topic, ch, global_style, episode_notes
-                )
-        st.success("Chapters generated. Expand any chapter to edit.")
+        try:
+            with st.spinner("Writing chapter scripts..."):
+                for i, ch in enumerate(st.session_state.outline, 1):
+                    txt = generate_chapter_script(topic, ch, global_style, episode_notes)
+                    st.session_state[f"chapter_text_{i}"] = txt
+            st.success("Chapters generated. Expand any chapter to edit.")
+            st.session_state.built = None
+            st.rerun()
+        except Exception as e:
+            st.error(f"Chapter generation failed: {e}")
 
-    # Render editable chapters (PATCH: hydrate textarea values + stable keys)
+    # Render chapters (keys hold the truth)
     for i, ch in enumerate(st.session_state.outline, 1):
         title = ch.get("title", f"Chapter {i}")
-        if i not in st.session_state.scripts:
-            st.session_state.scripts[i] = ""
-
+        st.session_state.setdefault(f"chapter_text_{i}", "")
         with st.expander(f"Chapter {i}: {title}", expanded=(i == 1)):
-            edited = st.text_area(
-                f"Chapter {i} text",
-                value=st.session_state.scripts[i],
-                height=280,
-                key=f"chapter_text_{i}",
-            )
-            st.session_state.scripts[i] = edited
+            st.text_area(f"Chapter {i} text", key=f"chapter_text_{i}", height=280)
 
     # Outro
     st.subheader("Outro")
@@ -531,17 +527,17 @@ else:
     c3, c4 = st.columns([1, 3], gap="large")
     with c3:
         if st.button("Generate Outro"):
-            with st.spinner("Writing outro..."):
-                st.session_state.outro = generate_outro(topic, global_style, episode_notes)
-            st.success("Outro generated.")
+            try:
+                with st.spinner("Writing outro..."):
+                    st.session_state["outro_text"] = generate_outro(topic, global_style, episode_notes)
+                st.success("Outro generated.")
+                st.session_state.built = None
+                st.rerun()
+            except Exception as e:
+                st.error(f"Outro generation failed: {e}")
 
     with c4:
-        st.session_state.outro = st.text_area(
-            "Outro text",
-            value=st.session_state.outro,
-            height=220,
-            key="outro_text",
-        )
+        st.text_area("Outro text", key="outro_text", height=220)
 
 
 # ----------------------------
@@ -565,128 +561,131 @@ fade_s = st.slider("Music fade in/out (seconds)", 2, 12, 7)
 
 music_file = st.file_uploader("Upload background music (MP3/WAV)", type=["mp3", "wav"])
 music_path = None
-
-if music_file:
-    # saved to temp during build
-    pass
-elif os.path.exists(DEFAULT_MUSIC_PATH):
+if not music_file and os.path.exists(DEFAULT_MUSIC_PATH):
     music_path = DEFAULT_MUSIC_PATH
 
-# Require at least one chapter text to proceed
-has_any_chapter_text = any(v.strip() for v in st.session_state.scripts.values()) if isinstance(st.session_state.scripts, dict) else False
-build_disabled = (st.session_state.outline is None) or (not has_any_chapter_text and not st.session_state.intro.strip() and not st.session_state.outro.strip())
+# Determine if there's any text to render (from widget keys)
+outline_len = len(st.session_state.outline) if st.session_state.outline else 0
+has_any_text = bool(
+    (st.session_state.get("intro_text") or "").strip()
+    or (st.session_state.get("outro_text") or "").strip()
+    or any((st.session_state.get(f"chapter_text_{i}") or "").strip() for i in range(1, outline_len + 1))
+)
 
-build = st.button("Generate Audio + Export", type="primary", disabled=build_disabled)
+build = st.button("Generate Audio + Export", type="primary", disabled=not has_any_text)
 
 if build:
-    with tempfile.TemporaryDirectory() as td:
-        # Write music to temp if uploaded
-        if music_file:
-            # Preserve extension if possible
-            ext = ".mp3"
-            if music_file.name.lower().endswith(".wav"):
-                ext = ".wav"
-            music_path = os.path.join(td, f"music_upload{ext}")
-            with open(music_path, "wb") as f:
-                f.write(music_file.read())
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            # Save uploaded music into temp
+            if music_file:
+                ext = ".mp3"
+                if music_file.name.lower().endswith(".wav"):
+                    ext = ".wav"
+                music_path = os.path.join(td, f"music_upload{ext}")
+                with open(music_path, "wb") as f:
+                    f.write(music_file.read())
 
-        if not music_path:
-            st.error("Please upload a music file (or set a default music path).")
-            st.stop()
+            if not music_path:
+                st.error("Please upload a music file (or set a default music path).")
+                st.stop()
 
-        # Build sections in correct order: Intro -> Chapters -> Outro
-        sections: List[Tuple[str, str, str]] = []
+            # Build sections in order: Intro -> Chapters -> Outro
+            sections: List[Tuple[str, str, str]] = []
 
-        if st.session_state.intro.strip():
-            sections.append(("intro", "Intro", st.session_state.intro.strip()))
+            intro_txt = (st.session_state.get("intro_text") or "").strip()
+            if intro_txt:
+                sections.append(("intro", "Intro", intro_txt))
 
-        total_chapters = len(st.session_state.outline) if st.session_state.outline else 0
-        for idx in range(1, total_chapters + 1):
-            txt = st.session_state.scripts.get(idx, "").strip()
-            if not txt:
-                continue
-            title = st.session_state.outline[idx - 1]["title"]
-            sections.append((f"chapter_{idx:02d}", title, txt))
-
-        if st.session_state.outro.strip():
-            sections.append(("outro", "Outro", st.session_state.outro.strip()))
-
-        if not sections:
-            st.error("No Intro/Chapters/Outro text found to render. Generate scripts first.")
-            st.stop()
-
-        mp3_blobs: Dict[str, bytes] = {}
-        titles: Dict[str, str] = {}
-        full_wav_paths: List[str] = []
-
-        st.info("Generating TTS and mixing background music…")
-        progress = st.progress(0)
-
-        for n, (slug, title, text) in enumerate(sections, start=1):
-            titles[slug] = title
-
-            raw_wav = os.path.join(td, f"{slug}_voice.wav")
-            mixed_wav = os.path.join(td, f"{slug}_mixed.wav")
-            out_mp3 = os.path.join(td, f"{slug}.mp3")
-
-            # TTS → wav
-            tts_to_wav(text, tts_instructions, speed, raw_wav)
-
-            # Mix music under voice → wav
-            mix_music_under_voice(raw_wav, music_path, mixed_wav, music_db=music_db, fade_s=fade_s)
-
-            # Convert to mp3
-            wav_to_mp3(mixed_wav, out_mp3)
-
-            with open(out_mp3, "rb") as f:
-                mp3_blobs[slug] = f.read()
-
-            full_wav_paths.append(mixed_wav)
-            progress.progress(min(1.0, n / len(sections)))
-
-        # Full episode
-        full_wav = os.path.join(td, "full_episode.wav")
-        full_mp3 = os.path.join(td, "full_episode.mp3")
-        concat_wavs(full_wav_paths, full_wav)
-        wav_to_mp3(full_wav, full_mp3)
-
-        with open(full_mp3, "rb") as f:
-            full_mp3_bytes = f.read()
-
-        # ZIP pack
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr("scripts/episode_topic.txt", topic)
-
-            # Scripts
-            if st.session_state.intro.strip():
-                z.writestr("scripts/intro.txt", st.session_state.intro)
-
-            for idx in range(1, total_chapters + 1):
+            for idx in range(1, outline_len + 1):
+                txt = (st.session_state.get(f"chapter_text_{idx}") or "").strip()
+                if not txt:
+                    continue
                 title = st.session_state.outline[idx - 1]["title"]
-                z.writestr(
-                    f"scripts/chapter_{idx:02d}_{clean_filename(title)}.txt",
-                    st.session_state.scripts.get(idx, ""),
-                )
+                sections.append((f"chapter_{idx:02d}", title, txt))
 
-            if st.session_state.outro.strip():
-                z.writestr("scripts/outro.txt", st.session_state.outro)
+            outro_txt = (st.session_state.get("outro_text") or "").strip()
+            if outro_txt:
+                sections.append(("outro", "Outro", outro_txt))
 
-            # Audio per section
-            for slug, blob in mp3_blobs.items():
-                z.writestr(f"audio/{slug}_{clean_filename(titles.get(slug, slug))}.mp3", blob)
+            if not sections:
+                st.error("No Intro/Chapters/Outro text found. Generate scripts first.")
+                st.stop()
 
-            # Full audio
-            z.writestr("audio/full_episode.mp3", full_mp3_bytes)
+            mp3_blobs: Dict[str, bytes] = {}
+            titles: Dict[str, str] = {}
+            full_wav_paths: List[str] = []
 
-        zip_buf.seek(0)
+            st.info("Generating TTS and mixing background music…")
+            progress = st.progress(0)
 
-        st.session_state.built = {
-            "zip": zip_buf.getvalue(),
-            "full_mp3": full_mp3_bytes,
-        }
+            for n, (slug, title, text) in enumerate(sections, start=1):
+                titles[slug] = title
 
-        st.success("Done! Download your audio below.")
+                raw_wav = os.path.join(td, f"{slug}_voice.wav")
+                mixed_wav = os.path.join(td, f"{slug}_mixed.wav")
+                out_mp3 = os.path.join(td, f"{slug}.mp3")
+
+                # TTS -> voice wav
+                tts_to_wav(text, tts_instructions, speed, raw_wav)
+
+                # Mix music
+                mix_music_under_voice(raw_wav, music_path, mixed_wav, music_db=music_db, fade_s=fade_s)
+
+                # Encode mp3
+                wav_to_mp3(mixed_wav, out_mp3)
+
+                with open(out_mp3, "rb") as f:
+                    mp3_blobs[slug] = f.read()
+
+                full_wav_paths.append(mixed_wav)
+                progress.progress(min(1.0, n / len(sections)))
+
+            # Full episode
+            full_wav = os.path.join(td, "full_episode.wav")
+            full_mp3 = os.path.join(td, "full_episode.mp3")
+            concat_wavs(full_wav_paths, full_wav)
+            wav_to_mp3(full_wav, full_mp3)
+
+            with open(full_mp3, "rb") as f:
+                full_mp3_bytes = f.read()
+
+            # ZIP pack
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                z.writestr("scripts/episode_topic.txt", topic)
+
+                # scripts
+                if intro_txt:
+                    z.writestr("scripts/intro.txt", intro_txt)
+
+                for idx in range(1, outline_len + 1):
+                    title = st.session_state.outline[idx - 1]["title"]
+                    txt = st.session_state.get(f"chapter_text_{idx}") or ""
+                    z.writestr(f"scripts/chapter_{idx:02d}_{clean_filename(title)}.txt", txt)
+
+                if outro_txt:
+                    z.writestr("scripts/outro.txt", outro_txt)
+
+                # audio sections
+                for slug, blob in mp3_blobs.items():
+                    z.writestr(f"audio/{slug}_{clean_filename(titles.get(slug, slug))}.mp3", blob)
+
+                # full audio
+                z.writestr("audio/full_episode.mp3", full_mp3_bytes)
+
+            zip_buf.seek(0)
+
+            st.session_state.built = {
+                "zip": zip_buf.getvalue(),
+                "full_mp3": full_mp3_bytes,
+            }
+
+            st.success("Done! Download your audio below.")
+            st.rerun()
+
+    except Exception as e:
+        st.error(f"Audio build failed: {e}")
 
 
 # ----------------------------
@@ -696,13 +695,14 @@ st.header("4️⃣ Downloads")
 
 if st.session_state.built:
     st.download_button(
-        "⬇️ Download ZIP (Intro + chapters + outro scripts + section MP3s + full episode MP3)",
+        "⬇️ Download ZIP (scripts + section MP3s + full episode MP3)",
         data=st.session_state.built["zip"],
         file_name=f"{clean_filename(topic)}_uappress_pack.zip",
         mime="application/zip",
     )
 
     st.audio(st.session_state.built["full_mp3"], format="audio/mp3")
+
     st.download_button(
         "⬇️ Download Full Episode MP3",
         data=st.session_state.built["full_mp3"],
