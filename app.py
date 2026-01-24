@@ -75,7 +75,8 @@ def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
     # ffmpeg concat demuxer needs a file list
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for wp in wav_paths:
-            f.write(f"file '{wp.replace(\"'\", \"\\\\'\")}'\n")
+            safe_wp = wp.replace("'", "'\\''")
+            f.write(f"file '{safe_wp}'\n")
         list_path = f.name
 
     cmd = [
@@ -85,6 +86,7 @@ def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
         "-c", "copy",
         out_wav
     ]
+
     try:
         run_ffmpeg(cmd)
     finally:
@@ -92,7 +94,7 @@ def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
             os.remove(list_path)
         except Exception:
             pass
-
+            
 def mix_music_under_voice(
     voice_wav: str,
     music_path: str,
