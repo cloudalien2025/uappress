@@ -9,6 +9,7 @@
 # - No pydub (avoids ffmpeg/avlib install issues on Streamlit Cloud)
 # - Uses ffmpeg (bundled via imageio_ffmpeg) for concat + music mix
 # - Fixes Streamlit state sync so generated text ALWAYS appears
+# - FIX: avoids StreamlitAPIException by never assigning to widget-owned keys after widget creation
 
 import io
 import os
@@ -18,7 +19,7 @@ import time
 import zipfile
 import tempfile
 import subprocess
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Tuple
 
 import streamlit as st
 from openai import OpenAI
@@ -138,10 +139,7 @@ def json_outline_from_model(prompt: str) -> dict:
     try:
         return extract_json_object(content)
     except Exception:
-        stricter = (
-            prompt
-            + "\n\nIMPORTANT: Return ONLY valid JSON. No prose, no markdown, no code fences."
-        )
+        stricter = prompt + "\n\nIMPORTANT: Return ONLY valid JSON. No prose, no markdown, no code fences."
         content2 = safe_chat(stricter, temperature=0.15, tries=2)
         return extract_json_object(content2)
 
@@ -149,7 +147,6 @@ def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
     # ffmpeg concat demuxer list file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for wp in wav_paths:
-            # Safest: escape only single-quotes for ffmpeg concat list syntax
             f.write("file '{}'\n".format(wp.replace("'", "'\\''")))
         list_path = f.name
 
@@ -184,7 +181,6 @@ def get_audio_duration_seconds(path: str) -> float:
     """
     cmd = [FFMPEG, "-i", path]
     code, out, err = run_cmd(cmd)
-    # ffmpeg returns nonzero for "-i" without output; we parse stderr anyway
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
     if not m:
         return 0.0
@@ -204,11 +200,8 @@ def mix_music_under_voice(
     Loops music to match voice duration, applies volume + fades, mixes under voice, normalizes loudness.
     """
     dur = max(0.0, get_audio_duration_seconds(voice_wav))
-    # If duration unknown, fallback: no fade-out timing
     fade_out_start = max(0.0, dur - fade_s) if dur > 0 else 0.0
 
-    # Music chain: volume, fade in, fade out at end, then mix
-    # Music is already stream_loop=-1 on input 1.
     music_chain = (
         f"[1:a]volume={music_db}dB,"
         f"afade=t=in:st=0:d={fade_s},"
@@ -235,8 +228,6 @@ def mix_music_under_voice(
 def tts_to_wav(text: str, delivery_instructions: str, speed: float, out_wav: str) -> None:
     """
     Generates multiple short WAV chunks via OpenAI TTS, then concatenates into one WAV.
-    Important: OpenAI Python expects response_format (NOT format).
-    We embed instructions into the input to avoid API param mismatch across versions.
     """
     chunks = chunk_text(text, max_chars=3200)
     wav_parts: List[str] = []
@@ -269,16 +260,11 @@ def tts_to_wav(text: str, delivery_instructions: str, speed: float, out_wav: str
 # Streamlit state (single source of truth)
 # ----------------------------
 def ensure_state():
-    if "outline" not in st.session_state:
-        st.session_state.outline = []  # list of dicts
-    if "chapter_count" not in st.session_state:
-        st.session_state.chapter_count = 0
-    if "built" not in st.session_state:
-        st.session_state.built = None
-    if "topic" not in st.session_state:
-        st.session_state.topic = "Roswell UFO Incident"
-    if "last_outline_params" not in st.session_state:
-        st.session_state.last_outline_params = None
+    st.session_state.setdefault("outline", [])            # list[dict]
+    st.session_state.setdefault("chapter_count", 0)
+    st.session_state.setdefault("built", None)
+    st.session_state.setdefault("topic", "Roswell UFO Incident")
+    st.session_state.setdefault("last_outline_params", None)
 
 ensure_state()
 
@@ -286,11 +272,18 @@ def text_key(kind: str, idx: int = 0) -> str:
     # kind in {"intro", "chapter", "outro"}
     return f"text::{kind}::{idx}"
 
+def ensure_text_key(kind: str, idx: int = 0, default: str = "") -> str:
+    """
+    IMPORTANT:
+    Only initializes state if missing.
+    Never overwrites widget-managed keys.
+    """
+    k = text_key(kind, idx)
+    st.session_state.setdefault(k, default or "")
+    return k
+
 def get_text(kind: str, idx: int = 0) -> str:
     return st.session_state.get(text_key(kind, idx), "")
-
-def set_text(kind: str, idx: int, value: str) -> None:
-    st.session_state[text_key(kind, idx)] = value or ""
 
 
 # ----------------------------
@@ -399,8 +392,14 @@ OUTRO REQUIREMENTS:
 Return ONLY the outro narration text. No headings.
 """.strip()
 
-def prompt_chapter(topic: str, chapter_title: str, target_minutes: int, beats: List[str], global_style: str, episode_notes: str) -> str:
-    # Typical doc narration: ~135–155 wpm. Use 145 wpm.
+def prompt_chapter(
+    topic: str,
+    chapter_title: str,
+    target_minutes: int,
+    beats: List[str],
+    global_style: str,
+    episode_notes: str,
+) -> str:
     words = int(target_minutes * 145)
     beats_block = "\n".join([f"- {b}" for b in beats]) if beats else "- (No beats provided)"
     return f"""
@@ -473,14 +472,14 @@ episode_notes = st.text_area(
     height=120,
 )
 
-# Outline generation
 outline_btn = st.button("Generate Chapter Outline", type="primary")
 if outline_btn:
     with st.spinner("Creating outline…"):
-        data = json_outline_from_model(prompt_outline(topic, total_minutes, chapter_minutes, global_style, episode_notes))
+        data = json_outline_from_model(
+            prompt_outline(topic, total_minutes, chapter_minutes, global_style, episode_notes)
+        )
         chapters_list = data.get("chapters", [])
 
-        # Normalize
         normalized = []
         for ch in chapters_list:
             title = str(ch.get("title", "")).strip() or "Untitled Chapter"
@@ -498,12 +497,11 @@ if outline_btn:
         st.session_state.chapter_count = len(normalized)
         st.session_state.built = None
 
-        # IMPORTANT: seed widget state so text areas always show content later
-        # (blank by default until generated)
-        set_text("intro", 0, get_text("intro", 0) or "")
+        # Seed widget keys safely (init-only; no overwrites)
+        ensure_text_key("intro", 0, "")
         for i in range(1, st.session_state.chapter_count + 1):
-            set_text("chapter", i, get_text("chapter", i) or "")
-        set_text("outro", 0, get_text("outro", 0) or "")
+            ensure_text_key("chapter", i, "")
+        ensure_text_key("outro", 0, "")
 
         st.success("Outline generated.")
 
@@ -518,13 +516,20 @@ if st.session_state.outline:
 # ----------------------------
 st.header("2️⃣ Scripts")
 
+# Ensure keys exist BEFORE widgets are created
+ensure_text_key("intro", 0, "")
+ensure_text_key("outro", 0, "")
+for i in range(1, st.session_state.chapter_count + 1):
+    ensure_text_key("chapter", i, "")
+
 left, right = st.columns([1, 1])
 
 with left:
     if st.button("Generate Intro", type="secondary", disabled=not st.session_state.outline):
         with st.spinner("Writing intro…"):
             intro_text = safe_chat(prompt_intro(topic, global_style, episode_notes), temperature=0.55, tries=2)
-            set_text("intro", 0, intro_text)
+            # Safe: happens before the widget is created later in this run
+            st.session_state[text_key("intro", 0)] = intro_text
             st.session_state.built = None
         st.success("Intro generated.")
 
@@ -532,11 +537,10 @@ with right:
     if st.button("Generate Outro", type="secondary", disabled=not st.session_state.outline):
         with st.spinner("Writing outro…"):
             outro_text = safe_chat(prompt_outro(topic, global_style, episode_notes), temperature=0.55, tries=2)
-            set_text("outro", 0, outro_text)
+            st.session_state[text_key("outro", 0)] = outro_text
             st.session_state.built = None
         st.success("Outro generated.")
 
-# Intro editor (KEYED to session_state so it always shows)
 st.subheader("Intro")
 st.text_area(
     "Intro text",
@@ -544,12 +548,9 @@ st.text_area(
     height=220,
     placeholder="Click Generate Intro to populate…",
 )
-# Keep the value mirrored as canonical (optional but useful for exports)
-set_text("intro", 0, st.session_state.get(text_key("intro", 0), ""))
 
 st.divider()
 
-# Chapter controls
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     gen_all = st.button("Generate All Chapters", disabled=not st.session_state.outline)
@@ -559,10 +560,19 @@ with c3:
     st.caption("Tip: Expand a chapter to generate/edit. The text box will always show what’s stored.")
 
 if clear_all:
-    for i in range(1, st.session_state.chapter_count + 1):
-        set_text("chapter", i, "")
-        st.session_state[text_key("chapter", i)] = ""
+    # Safe: occurs before chapter widgets are created? (Not necessarily)
+    # Therefore: do NOT directly assign after widgets exist in the same run.
+    # Use a rerun-safe pattern: set a flag, then clear keys before rendering editors.
+    st.session_state["_clear_chapters_requested"] = True
     st.session_state.built = None
+    st.rerun()
+
+if st.session_state.get("_clear_chapters_requested"):
+    for i in range(1, st.session_state.chapter_count + 1):
+        k = text_key("chapter", i)
+        # This happens at the top of the rerun BEFORE widgets render.
+        st.session_state[k] = ""
+    st.session_state["_clear_chapters_requested"] = False
     st.success("Chapters cleared.")
 
 if gen_all and st.session_state.outline:
@@ -573,13 +583,10 @@ if gen_all and st.session_state.outline:
                 temperature=0.6,
                 tries=2,
             )
-            # CRITICAL: write into the widget key so it displays immediately
             st.session_state[text_key("chapter", i)] = txt
-            set_text("chapter", i, txt)
         st.session_state.built = None
     st.success("All chapters generated.")
 
-# Chapter editors
 if st.session_state.outline:
     for i, ch in enumerate(st.session_state.outline, 1):
         with st.expander(f"Chapter {i}: {ch['title']}", expanded=(i == 1)):
@@ -594,7 +601,6 @@ if st.session_state.outline:
                             tries=2,
                         )
                         st.session_state[text_key("chapter", i)] = txt
-                        set_text("chapter", i, txt)
                         st.session_state.built = None
                     st.success(f"Chapter {i} generated.")
             with cc2:
@@ -604,11 +610,9 @@ if st.session_state.outline:
                     height=320,
                     placeholder="Click Generate Chapter to populate…",
                 )
-                set_text("chapter", i, st.session_state.get(text_key("chapter", i), ""))
 
 st.divider()
 
-# Outro editor
 st.subheader("Outro")
 st.text_area(
     "Outro text",
@@ -616,7 +620,6 @@ st.text_area(
     height=220,
     placeholder="Click Generate Outro to populate…",
 )
-set_text("outro", 0, st.session_state.get(text_key("outro", 0), ""))
 
 
 # ----------------------------
@@ -640,7 +643,6 @@ fade_s = st.slider("Music fade in/out (seconds)", 2, 12, 6, 1)
 
 music_file = st.file_uploader("Upload background music (MP3/WAV)", type=["mp3", "wav"])
 
-# Determine if we have enough text to build
 def has_any_script() -> bool:
     if get_text("intro", 0).strip():
         return True
@@ -652,13 +654,11 @@ def has_any_script() -> bool:
     return False
 
 build_disabled = (not st.session_state.outline) or (not has_any_script())
-
 build = st.button("Generate Audio + Export", type="primary", disabled=build_disabled)
 
 if build:
     try:
         with tempfile.TemporaryDirectory() as td:
-            # Save music
             chosen_music_path = None
             if music_file:
                 chosen_music_path = os.path.join(td, "music_upload")
@@ -673,8 +673,7 @@ if build:
                 st.error("Please upload a music file (or ensure DEFAULT_MUSIC_PATH exists).")
                 st.stop()
 
-            # Build ordered segments: Intro -> Chapters -> Outro (skip blanks)
-            segments: List[Tuple[str, str]] = []  # (slug, text)
+            segments: List[Tuple[str, str]] = []
             if get_text("intro", 0).strip():
                 segments.append(("intro", get_text("intro", 0).strip()))
 
@@ -703,13 +702,8 @@ if build:
                 mixed_wav = os.path.join(td, f"{slug}_mixed.wav")
                 out_mp3 = os.path.join(td, f"{slug}.mp3")
 
-                # TTS -> wav
                 tts_to_wav(txt, tts_instructions, speed, voice_wav)
-
-                # Mix music under voice -> wav
                 mix_music_under_voice(voice_wav, chosen_music_path, mixed_wav, music_db=music_db, fade_s=fade_s)
-
-                # wav -> mp3
                 wav_to_mp3(mixed_wav, out_mp3)
 
                 with open(out_mp3, "rb") as f:
@@ -718,7 +712,6 @@ if build:
                 mixed_wavs.append(mixed_wav)
                 progress.progress(min(1.0, idx / total))
 
-            # Full episode
             full_wav = os.path.join(td, "full_episode.wav")
             full_mp3 = os.path.join(td, "full_episode.mp3")
             concat_wavs(mixed_wavs, full_wav)
@@ -727,19 +720,17 @@ if build:
             with open(full_mp3, "rb") as f:
                 full_mp3_bytes = f.read()
 
-            # ZIP pack
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
                 z.writestr("scripts/topic.txt", topic)
-
-                # scripts
                 z.writestr("scripts/intro.txt", get_text("intro", 0))
+
                 for i in range(1, st.session_state.chapter_count + 1):
                     title = st.session_state.outline[i - 1]["title"]
                     z.writestr(f"scripts/chapter_{i:02d}_{clean_filename(title)}.txt", get_text("chapter", i))
+
                 z.writestr("scripts/outro.txt", get_text("outro", 0))
 
-                # audio segments
                 for slug, b in per_segment_mp3.items():
                     z.writestr(f"audio/{slug}.mp3", b)
                 z.writestr("audio/full_episode.mp3", full_mp3_bytes)
