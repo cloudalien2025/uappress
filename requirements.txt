@@ -2,3 +2,4 @@ streamlit>=1.37.0
 openai>=1.40.0
 pydub>=0.25.1
 imageio-ffmpeg>=0.4.9
+pyaudioop
