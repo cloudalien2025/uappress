@@ -108,6 +108,38 @@ def sanitize_for_tts(text: str) -> str:
     return t.strip()
 # --- END PATCH ---
 
+# --- PATCH: strip directive text so TTS never reads it aloud ---
+def strip_tts_directives(text: str) -> str:
+    """
+    Removes any accidental directive blocks that can get spoken by TTS.
+    """
+    if not text:
+        return ""
+
+    t = text
+
+    # Remove common directive header lines if present anywhere
+    t = re.sub(r"(?im)^\s*VOICE\s*DIRECTION.*$\n?", "", t)
+    t = re.sub(r"(?im)^\s*PACE\s*:.*$\n?", "", t)
+    t = re.sub(r"(?im)^\s*STYLE\s*:.*$\n?", "", t)
+
+    # Remove the exact repeated global-style block (if it ever gets embedded)
+    t = re.sub(
+        r"(?is)Calm,\s*authoritative\s*male\s*narrator\.\s*"
+        r"Serious\s*investigative\s*documentary\s*tone\.\s*"
+        r"Measured\s*pacing\s*with\s*subtle\s*pauses\.\s*"
+        r"Clarity\s*first\.\s*No\s*hype,\s*no\s*jokes,\s*no\s*sensationalism\.\s*"
+        r"Label\s*uncertainty\s*clearly:\s*verified\s*facts\s*vs\s*disputed\s*claims\s*vs\s*theories\.\s*"
+        r"Audio-only\s*narration;\s*do\s*not\s*reference\s*visuals\.\s*",
+        "",
+        t,
+    )
+
+    # Clean up spacing
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+# --- END PATCH ---
+
 def extract_json_object(text: str) -> dict:
     """
     Robustly extract a JSON object from a model response.
@@ -250,12 +282,9 @@ def tts_to_wav(text: str, delivery_instructions: str, speed: float, out_wav: str
 
     with tempfile.TemporaryDirectory() as td:
         for i, ch in enumerate(chunks, start=1):
-            payload = (
-                f"VOICE DIRECTION (follow closely): {delivery_instructions}\n"
-                f"PACE: {speed:.2f}x\n"
-                f"STYLE: investigative documentary; restrained.\n\n"
-                f"{ch}"
-            )
+            # --- PATCH: prevent directive text from ever being spoken ---
+            payload = strip_tts_directives(sanitize_for_tts(ch))
+            # --- END PATCH ---
 
             r = client.audio.speech.create(
                 model=TTS_MODEL,
@@ -337,15 +366,15 @@ REQUIREMENTS:
 - Keep a strong narrative arc: hook → evidence → conflict → implications → unresolved questions
 
 Return ONLY valid JSON with this exact shape:
-{{
+{
   "chapters": [
-    {{
+    {
       "title": "string",
       "target_minutes": 10,
       "beats": ["string", "string"]
-    }}
+    }
   ]
-}}
+}
 """.strip()
 
 def prompt_intro(topic: str, global_style: str, episode_notes: str) -> str:
@@ -719,7 +748,7 @@ if build:
                 out_mp3 = os.path.join(td, f"{slug}.mp3")
 
                 # --- PATCH: sanitize text right before TTS ---
-                tts_to_wav(sanitize_for_tts(txt), tts_instructions, speed, voice_wav)
+                tts_to_wav(strip_tts_directives(sanitize_for_tts(txt)), tts_instructions, speed, voice_wav)
 
                 mix_music_under_voice(voice_wav, chosen_music_path, mixed_wav, music_db=music_db, fade_s=fade_s)
                 wav_to_mp3(mixed_wav, out_mp3)
