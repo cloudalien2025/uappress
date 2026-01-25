@@ -704,6 +704,31 @@ if build:
 
                 clean_txt = sanitize_for_tts(txt)
                 tts_to_wav(clean_txt, tts_instructions, speed, voice_wav)
+    def sanitize_for_tts(text: str) -> str:
+    """
+    Removes invisible Unicode control characters and empty artifact lines
+    that cause TTS glitches or narration resets.
+    """
+    if not text:
+        return ""
+
+    t = text
+
+    # Remove zero-width & directional Unicode chars (INVISIBLE but real)
+    t = re.sub(
+        r"[\u200B\u200C\u200D\u200E\u200F\u202A-\u202E\u2060\uFEFF]",
+        "",
+        t,
+    )
+
+    # Remove lines that LOOK empty but aren't (contain invisible chars)
+    t = re.sub(r"(?m)^\s*$\n\s*$", "\n", t)
+
+    # Normalize excessive newlines
+    t = re.sub(r"\n{3,}", "\n\n", t)
+
+    return t.strip()
+
 
                 mix_music_under_voice(voice_wav, chosen_music_path, mixed_wav, music_db=music_db, fade_s=fade_s)
                 wav_to_mp3(mixed_wav, out_mp3)
