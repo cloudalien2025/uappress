@@ -702,7 +702,9 @@ if build:
                 mixed_wav = os.path.join(td, f"{slug}_mixed.wav")
                 out_mp3 = os.path.join(td, f"{slug}.mp3")
 
-                tts_to_wav(txt, tts_instructions, speed, voice_wav)
+                clean_txt = sanitize_for_tts(txt)
+                tts_to_wav(clean_txt, tts_instructions, speed, voice_wav)
+
                 mix_music_under_voice(voice_wav, chosen_music_path, mixed_wav, music_db=music_db, fade_s=fade_s)
                 wav_to_mp3(mixed_wav, out_mp3)
 
