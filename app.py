@@ -366,15 +366,15 @@ REQUIREMENTS:
 - Keep a strong narrative arc: hook → evidence → conflict → implications → unresolved questions
 
 Return ONLY valid JSON with this exact shape:
-{
+{{
   "chapters": [
-    {
+    {{
       "title": "string",
       "target_minutes": 10,
       "beats": ["string", "string"]
-    }
+    }}
   ]
-}
+}}
 """.strip()
 
 def prompt_intro(topic: str, global_style: str, episode_notes: str) -> str:
