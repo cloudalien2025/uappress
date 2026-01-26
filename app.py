@@ -402,7 +402,7 @@ INTRO REQUIREMENTS:
 - Engagement CTA:
   - Ask listeners to subscribe
   - Ask them to comment where they’re listening from
-  - Ask them to share what they believe happened (open-ended)
+  - Ask them to share what you believe happened (open-ended)
 
 Return ONLY the intro narration text. No headings.
 """.strip()
@@ -605,9 +605,6 @@ with c3:
     st.caption("Tip: Expand a chapter to generate/edit. The text box will always show what’s stored.")
 
 if clear_all:
-    # Safe: occurs before chapter widgets are created? (Not necessarily)
-    # Therefore: do NOT directly assign after widgets exist in the same run.
-    # Use a rerun-safe pattern: set a flag, then clear keys before rendering editors.
     st.session_state["_clear_chapters_requested"] = True
     st.session_state.built = None
     st.rerun()
@@ -615,7 +612,6 @@ if clear_all:
 if st.session_state.get("_clear_chapters_requested"):
     for i in range(1, st.session_state.chapter_count + 1):
         k = text_key("chapter", i)
-        # This happens at the top of the rerun BEFORE widgets render.
         st.session_state[k] = ""
     st.session_state["_clear_chapters_requested"] = False
     st.success("Chapters cleared.")
@@ -759,6 +755,7 @@ if build:
                 mixed_wavs.append(mixed_wav)
                 progress.progress(min(1.0, idx / total))
 
+            # Build full episode MP3 for separate download (NOT placed in the ZIP)
             full_wav = os.path.join(td, "full_episode.wav")
             full_mp3 = os.path.join(td, "full_episode.mp3")
             concat_wavs(mixed_wavs, full_wav)
@@ -767,6 +764,7 @@ if build:
             with open(full_mp3, "rb") as f:
                 full_mp3_bytes = f.read()
 
+            # ZIP: scripts + per-segment mp3s only (NO full_episode.mp3)
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
                 z.writestr("scripts/topic.txt", topic)
@@ -780,7 +778,8 @@ if build:
 
                 for slug, b in per_segment_mp3.items():
                     z.writestr(f"audio/{slug}.mp3", b)
-                z.writestr("audio/full_episode.mp3", full_mp3_bytes)
+
+                # NOTE: intentionally NOT writing audio/full_episode.mp3 into ZIP
 
             zip_buf.seek(0)
             st.session_state.built = {"zip": zip_buf.getvalue(), "full_mp3": full_mp3_bytes}
@@ -796,7 +795,7 @@ st.header("4️⃣ Downloads")
 
 if st.session_state.built:
     st.download_button(
-        "⬇️ Download ZIP (scripts + segment MP3s + full episode MP3)",
+        "⬇️ Download ZIP (scripts + segment MP3s)",
         data=st.session_state.built["zip"],
         file_name=f"{clean_filename(topic)}_uappress_pack.zip",
         mime="application/zip",
