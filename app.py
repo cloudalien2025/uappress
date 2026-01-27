@@ -1,19 +1,21 @@
-# app.py — UAPpress Documentary TTS Studio (MVP) — INVESTIGATIVE MODE ONLY (Watergate)
+# ============================
+# PART 1/3 — Core Setup, Clients, Audio Engine, Text Sanitizers
+# ============================
+
+# app.py — UAPpress Documentary TTS Studio (MVP)
+# INVESTIGATIVE MODE (Watergate-style)
 # ------------------------------------------------------------
-# REQUIREMENTS (put these in requirements.txt):
+# REQUIREMENTS (requirements.txt):
 # streamlit>=1.30
 # openai>=1.0.0
 # imageio-ffmpeg>=0.4.9
 #
-# Notes:
-# - No pydub (avoids ffmpeg/avlib install issues on Streamlit Cloud)
-# - Uses ffmpeg (bundled via imageio_ffmpeg) for concat + music mix
-# - FIX: avoids StreamlitAPIException by never assigning to widget-owned keys after widget creation
-#
-# THIS VERSION:
-# - Investigative (Watergate) mode ONLY (no toggle)
-# - Central Question required
-# - Generic anti-repetition + continuity handoff between chapters (works for any episode)
+# DESIGN GOALS:
+# - Audio-first investigative documentaries
+# - No book-style narration
+# - No chapter roadmaps
+# - Continuity-safe, repetition-safe
+# - Streamlit Cloud compatible
 
 import io
 import os
@@ -34,8 +36,8 @@ import imageio_ffmpeg
 # Page setup
 # ----------------------------
 st.set_page_config(page_title="UAPpress Documentary Studio", layout="wide")
-st.title("🛸 UAPpress — Documentary TTS Studio (MVP)")
-st.caption("Investigative (Watergate) mode: Central Question + chaptered script + Onyx narration with music mix.")
+st.title("🛸 UAPpress — Documentary TTS Studio")
+st.caption("Investigative, audio-first documentaries. No hype. No roadmap narration.")
 
 
 # ----------------------------
@@ -43,7 +45,7 @@ st.caption("Investigative (Watergate) mode: Central Question + chaptered script 
 # ----------------------------
 api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not api_key:
-    st.error("OPENAI_API_KEY not found. Add it to Streamlit Secrets as OPENAI_API_KEY.")
+    st.error("OPENAI_API_KEY not found. Add it to Streamlit Secrets.")
     st.stop()
 
 client = OpenAI(api_key=api_key)
@@ -54,26 +56,27 @@ TTS_VOICE = "onyx"
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-# Optional local default (won't exist on Streamlit Cloud unless you upload it)
 DEFAULT_MUSIC_PATH = "/mnt/data/dark-ambient-soundscape-music-409350.mp3"
 
 
 # ----------------------------
-# Investigative Documentary Mode (Watergate-style)
+# Investigative system role
 # ----------------------------
 INVESTIGATIVE_SYSTEM = """
-You are a serious investigative documentary writer working in the tradition of Watergate-era reporting, the Pentagon Papers, and Frontline.
+You are a serious investigative documentary writer in the tradition of Watergate-era reporting,
+the Pentagon Papers, and Frontline.
 
-This is not a UFO hype piece, speculative essay, or recap explainer.
+This is NOT a book, lecture, or explainer.
+This is NOT a roadmap-style narration.
 
-Your job is to investigate institutional behavior, credibility, secrecy, and power—using the incident only as the factual setting.
-
-Write for an intelligent, skeptical audience. Use restraint, precision, and evidentiary discipline.
+Write as if the listener is already inside the story.
+Never announce structure. Never preview chapters.
+Every line should feel like evidence or consequence.
 """.strip()
 
 
 # ----------------------------
-# Helpers
+# Shell helpers
 # ----------------------------
 def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -81,7 +84,7 @@ def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
 
 
 def run_ffmpeg(cmd: List[str]) -> None:
-    code, out, err = run_cmd(cmd)
+    code, _, err = run_cmd(cmd)
     if code != 0:
         raise RuntimeError(f"ffmpeg failed:\n{err[-4000:]}")
 
@@ -92,12 +95,17 @@ def clean_filename(text: str) -> str:
     return (text.lower()[:80] or "episode")
 
 
+# ----------------------------
+# Text chunking for TTS
+# ----------------------------
 def chunk_text(text: str, max_chars: int = 3200) -> List[str]:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if len(text) <= max_chars:
         return [text]
+
     parts = text.split("\n\n")
     chunks, buf, length = [], [], 0
+
     for p in parts:
         p = p.strip()
         if not p:
@@ -109,29 +117,29 @@ def chunk_text(text: str, max_chars: int = 3200) -> List[str]:
         else:
             buf.append(p)
             length += add
+
     if buf:
         chunks.append("\n\n".join(buf))
     return chunks
 
 
-# --- PATCH: sanitize invisible Unicode control chars before TTS ---
+# ----------------------------
+# Text sanitizers (TTS-safe)
+# ----------------------------
 def sanitize_for_tts(text: str) -> str:
     """
-    Removes invisible Unicode control characters that can cause TTS glitches/resets.
+    Removes invisible Unicode control characters that can break TTS.
     """
     if not text:
         return ""
-    t = text
-    t = re.sub(r"[\u200B\u200C\u200D\u200E\u200F\u202A-\u202E\u2060\uFEFF]", "", t)
+    t = re.sub(r"[\u200B\u200C\u200D\u200E\u200F\u202A-\u202E\u2060\uFEFF]", "", text)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
-# --- END PATCH ---
 
 
-# --- PATCH: strip directive text so TTS never reads it aloud ---
 def strip_tts_directives(text: str) -> str:
     """
-    Removes accidental directive blocks that can get spoken by TTS.
+    Removes accidental style/voice directives from model output.
     """
     if not text:
         return ""
@@ -140,29 +148,46 @@ def strip_tts_directives(text: str) -> str:
     t = re.sub(r"(?im)^\s*VOICE\s*DIRECTION.*$\n?", "", t)
     t = re.sub(r"(?im)^\s*PACE\s*:.*$\n?", "", t)
     t = re.sub(r"(?im)^\s*STYLE\s*:.*$\n?", "", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
-    t = re.sub(
-        r"(?is)Calm,\s*authoritative\s*male\s*narrator\.\s*"
-        r"Serious\s*investigative\s*documentary\s*tone\.\s*"
-        r"Measured\s*pacing\s*with\s*subtle\s*pauses\.\s*"
-        r"Clarity\s*first\.\s*No\s*hype,\s*no\s*jokes,\s*no\s*sensationalism\.\s*"
-        r"Label\s*uncertainty\s*clearly:\s*verified\s*facts\s*vs\s*disputed\s*claims\s*vs\s*theories\.\s*"
-        r"Audio-only\s*narration;\s*do\s*not\s*reference\s*visuals\.\s*",
-        "",
-        t,
-    )
+
+# ----------------------------
+# 🚫 Anti-book / Anti-roadmap cleaner (CRITICAL PATCH)
+# ----------------------------
+def strip_meta_narration(text: str) -> str:
+    """
+    Removes book-style roadmap narration:
+    'In the next chapter...', 'We will explore...', etc.
+    This guarantees documentary-style flow.
+    """
+    if not text:
+        return ""
+
+    t = text.strip()
+
+    patterns = [
+        r"(?im)^\s*in the next (chapter|section)[^.\n]*[.\n]\s*",
+        r"(?im)^\s*in chapter\s*\d+[^.\n]*[.\n]\s*",
+        r"(?im)^\s*this chapter[^.\n]*[.\n]\s*",
+        r"(?im)^\s*as we'?ll see[^.\n]*[.\n]\s*",
+        r"(?im)^\s*as discussed earlier[^.\n]*[.\n]\s*",
+        r"(?im)^\s*we will[^.\n]*[.\n]\s*",
+        r"(?im)^\s*we('?re| are) going to[^.\n]*[.\n]\s*",
+    ]
+
+    for p in patterns:
+        t = re.sub(p, "", t)
 
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
-# --- END PATCH ---
 
 
+# ----------------------------
+# JSON + OpenAI helpers
+# ----------------------------
 def extract_json_object(text: str) -> dict:
-    """
-    Robustly extract a JSON object from a model response.
-    """
     text = (text or "").strip()
-
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
     if m:
         text = m.group(1).strip()
@@ -174,7 +199,7 @@ def extract_json_object(text: str) -> dict:
 
     m2 = re.search(r"(\{.*\})", text, re.S)
     if not m2:
-        raise ValueError("Could not find a JSON object in the response.")
+        raise ValueError("Could not find JSON object in response.")
     return json.loads(m2.group(1))
 
 
@@ -202,20 +227,22 @@ def json_outline_from_model(prompt: str) -> dict:
     try:
         return extract_json_object(content)
     except Exception:
-        stricter = prompt + "\n\nIMPORTANT: Return ONLY valid JSON. No prose, no markdown, no code fences."
+        stricter = prompt + "\n\nIMPORTANT: Return ONLY valid JSON."
         content2 = safe_chat(stricter, temperature=0.15, tries=2)
         return extract_json_object(content2)
 
 
+# ----------------------------
+# Audio helpers
+# ----------------------------
 def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for wp in wav_paths:
-            f.write("file '{}'\n".format(wp.replace("'", "'\\''")))
+            f.write(f"file '{wp.replace(\"'\", \"'\\\\''\")}'\n")
         list_path = f.name
 
     try:
-        cmd = [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_wav]
-        run_ffmpeg(cmd)
+        run_ffmpeg([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_wav])
     finally:
         try:
             os.remove(list_path)
@@ -224,44 +251,30 @@ def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
 
 
 def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
-    cmd = [FFMPEG, "-y", "-i", wav_path, "-c:a", "libmp3lame", "-b:a", bitrate, mp3_path]
-    run_ffmpeg(cmd)
+    run_ffmpeg([FFMPEG, "-y", "-i", wav_path, "-c:a", "libmp3lame", "-b:a", bitrate, mp3_path])
 
 
 def get_audio_duration_seconds(path: str) -> float:
-    cmd = [FFMPEG, "-i", path]
-    code, out, err = run_cmd(cmd)
+    _, _, err = run_cmd([FFMPEG, "-i", path])
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
     if not m:
         return 0.0
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-    ss = float(m.group(3))
-    return hh * 3600 + mm * 60 + ss
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
 
-def mix_music_under_voice(
-    voice_wav: str,
-    music_path: str,
-    out_wav: str,
-    music_db: int = -24,
-    fade_s: int = 6,
-) -> None:
+def mix_music_under_voice(voice_wav: str, music_path: str, out_wav: str, music_db: int = -24, fade_s: int = 6) -> None:
     dur = max(0.0, get_audio_duration_seconds(voice_wav))
-    fade_out_start = max(0.0, dur - fade_s) if dur > 0 else 0.0
+    fade_out_start = max(0.0, dur - fade_s)
 
-    music_chain = (
+    filter_complex = (
         f"[1:a]volume={music_db}dB,"
         f"afade=t=in:st=0:d={fade_s},"
         f"afade=t=out:st={fade_out_start}:d={fade_s}[m];"
-    )
-    mix_chain = (
         f"[0:a][m]amix=inputs=2:duration=first:dropout_transition=2,"
         f"loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
     )
-    filter_complex = music_chain + mix_chain
 
-    cmd = [
+    run_ffmpeg([
         FFMPEG, "-y",
         "-i", voice_wav,
         "-stream_loop", "-1",
@@ -270,16 +283,15 @@ def mix_music_under_voice(
         "-map", "[aout]",
         "-c:a", "pcm_s16le",
         out_wav,
-    ]
-    run_ffmpeg(cmd)
+    ])
 
 
 def tts_to_wav(text: str, delivery_instructions: str, speed: float, out_wav: str) -> None:
-    chunks = chunk_text(text, max_chars=3200)
-    wav_parts: List[str] = []
+    chunks = chunk_text(text)
+    wav_parts = []
 
     with tempfile.TemporaryDirectory() as td:
-        for i, ch in enumerate(chunks, start=1):
+        for i, ch in enumerate(chunks, 1):
             payload = strip_tts_directives(sanitize_for_tts(ch))
             r = client.audio.speech.create(
                 model=TTS_MODEL,
@@ -287,7 +299,6 @@ def tts_to_wav(text: str, delivery_instructions: str, speed: float, out_wav: str
                 response_format="wav",
                 input=payload,
             )
-
             part_path = os.path.join(td, f"part_{i:02d}.wav")
             with open(part_path, "wb") as f:
                 f.write(r.read())
