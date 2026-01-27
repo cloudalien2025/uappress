@@ -294,6 +294,10 @@ def tts_to_wav(text: str, delivery_instructions: str, speed: float, out_wav: str
             wav_parts.append(part_path)
 
         concat_wavs(wav_parts, out_wav)
+        
+# ============================
+# PART 2/3 — Generic continuity + anti-repetition (episode-agnostic)
+# ============================        
 # ----------------------------
 # Generic continuity + anti-repetition (episode-agnostic)
 # ----------------------------
@@ -361,6 +365,10 @@ def extract_keyphrases(text: str, max_phrases: int = 24) -> List[str]:
 
 
 def build_continuity_rules(introduced: List[str], central_question: str) -> str:
+    """
+    Continuity rules that stop repetition WITHOUT banning names.
+    Key rule: introduce once (full name + role), then later: last name only, no redefinition.
+    """
     introduced_block = ", ".join(introduced) if introduced else "(none detected yet)"
     return f"""
 CONTINUITY RULE (NON-NEGOTIABLE):
@@ -373,7 +381,11 @@ DO NOT:
 - summarize earlier chapters
 - reset the timeline
 
-If you must reference something already introduced, do it in ONE short clause only, then move forward.
+NAMING RULE (CRITICAL):
+- First appearance of a person in the entire episode: FULL NAME + ROLE + why they matter (one tight sentence).
+- After first appearance: use LAST NAME ONLY.
+- Do NOT repeat roles, titles, or background in later chapters.
+- Assume the listener remembers.
 
 Already introduced (auto-extracted from prior text):
 {introduced_block}
@@ -464,6 +476,7 @@ REQUIREMENTS:
 - Beats should be chronological when possible
 - Separate: contemporaneous facts vs official statements vs later testimony vs disputed claims
 - Avoid recap beats (no 'as we discussed', no resetting the timeline)
+- Ensure key participants appear early in the outline so the listener isn’t lost
 
 Return ONLY valid JSON with this exact shape:
 {{
@@ -499,15 +512,27 @@ INTRO REQUIREMENTS:
 - Open with a specific moment/statement/decision that instantly raises doubt
 - Establish stakes: credibility, secrecy, institutional self-protection
 - Briefly preview what listeners will hear (without listing chapter numbers)
-- Include a sponsor mention that feels natural and premium:
-  - This episode is sponsored by OPA Nutrition
-  - Mention they make premium wellness supplements (focus, clarity, energy, resilience, long-term health)
-  - Mention the website: opanutrition.com
-  - Keep it compliant and non-medical (no disease claims)
-- Engagement CTA:
-  - Ask listeners to subscribe
-  - Ask them to comment where they’re listening from
-  - Ask them to share what you believe happened (open-ended)
+
+MANDATORY: KEY PLAYERS (ONE-TIME WHO’S WHO)
+- Include a tight key-players rundown in 2–4 sentences.
+- Each player gets: NAME + ROLE + why they matter (7–12 words).
+- Keep it brisk and intriguing; do NOT do biography.
+- After this introduction, assume the listener remembers these individuals.
+- Later chapters may use LAST NAMES only, with no redefinition.
+
+Then:
+- State the Central Question explicitly near the end.
+
+Sponsor mention (premium, compliant):
+- This episode is sponsored by OPA Nutrition
+- Mention they make premium wellness supplements (focus, clarity, energy, resilience, long-term health)
+- Mention the website: opanutrition.com
+- No disease claims
+
+Engagement CTA:
+- Ask listeners to subscribe
+- Ask them to comment where they’re listening from
+- Ask them to share what you believe happened (open-ended)
 
 Return ONLY the intro narration text. No headings.
 """.strip()
@@ -563,6 +588,15 @@ def prompt_chapter(
     beats_block = "\n".join([f"- {b}" for b in beats]) if beats else "- (No beats provided)"
     continuity = build_continuity_rules(introduced_phrases, central_question)
 
+    cast_requirement = ""
+    if chapter_index == 1:
+        cast_requirement = """
+MANDATORY (CHAPTER 1 ONLY): KEY PLAYERS LOCK-IN
+- In the first 20–30 seconds, identify the key players by FULL NAME + ROLE once (tight).
+- After this chapter, use LAST NAMES only with no role repetition.
+- No biographies. No recap. Just roles and why they matter.
+""".strip()
+
     return f"""
 Write CHAPTER {chapter_index} of an audio-only investigative documentary (Watergate-style).
 
@@ -582,6 +616,8 @@ EPISODE NOTES:
 {episode_notes}
 
 {continuity}
+
+{cast_requirement}
 
 HANDOFF (last paragraph of previous segment — begin immediately after this):
 {prev_chapter_tail if prev_chapter_tail else "[No previous text available; start in medias res without repeating the premise]"}
@@ -644,9 +680,10 @@ episode_notes = st.text_area(
     "Episode-specific notes",
     value=(
         "Focus on the timeline, key witnesses, institutional response, and how the official narrative evolved. "
-        "Separate contemporaneous facts from later testimony and disputed claims. Avoid invented details."
+        "Separate contemporaneous facts from later testimony and disputed claims. Avoid invented details.\n\n"
+        "If known, list key players to identify once early (Name + Role):"
     ),
-    height=120,
+    height=140,
 )
 
 outline_btn = st.button("Generate Chapter Outline", type="primary")
@@ -691,6 +728,11 @@ if st.session_state.outline:
     st.subheader("📑 Outline")
     for i, ch in enumerate(st.session_state.outline, 1):
         st.markdown(f"**{i}. {ch['title']}** ({ch['target_minutes']} min)")
+
+# ============================
+# PART 3/3 — Scripts + Audio + Downloads
+# ============================
+
 # ----------------------------
 # Scripts (Intro + Chapters + Outro)
 # ----------------------------
@@ -752,7 +794,7 @@ with c1:
 with c2:
     clear_all = st.button("Clear Chapters")
 with c3:
-    st.caption("Continuity is enforced automatically. Chapters will not repeat earlier material.")
+    st.caption("Continuity is enforced automatically. Intro/Chapter 1 introduces key players; later chapters reference last names only.")
 
 if clear_all:
     st.session_state["_clear_chapters_requested"] = True
@@ -770,8 +812,11 @@ if st.session_state.get("_clear_chapters_requested"):
 # ----------------------------
 if gen_all and st.session_state.outline:
     with st.spinner("Writing all chapters…"):
+        # Build introduced list from Intro (if present) so the naming rules work immediately
         introduced = extract_keyphrases(get_text("intro", 0))
 
+        # If intro is empty, we still want the model to avoid repeating the premise;
+        # entity list will grow as we generate chapters.
         for i, ch in enumerate(st.session_state.outline, 1):
             prev_tail = (
                 last_paragraph(get_text("intro", 0))
@@ -797,7 +842,7 @@ if gen_all and st.session_state.outline:
 
             st.session_state[text_key("chapter", i)] = txt
 
-            # Update introduced entities from everything so far
+            # Update introduced entities from everything so far (Intro + chapters generated)
             cumulative = (
                 get_text("intro", 0)
                 + "\n\n"
@@ -826,6 +871,7 @@ if st.session_state.outline:
                             else last_paragraph(get_text("chapter", i - 1))
                         )
 
+                        # Introduced list = everything before this chapter (Intro + prior chapters)
                         cumulative = (
                             get_text("intro", 0)
                             + "\n\n"
@@ -962,6 +1008,7 @@ if build:
                 mixed_wavs.append(mixed_wav)
                 progress.progress(min(1.0, idx / total))
 
+            # Full episode MP3 (separate download; not in zip)
             full_wav = os.path.join(td, "full_episode.wav")
             full_mp3 = os.path.join(td, "full_episode.mp3")
             concat_wavs(mixed_wavs, full_wav)
@@ -970,6 +1017,7 @@ if build:
             with open(full_mp3, "rb") as f:
                 full_mp3_bytes = f.read()
 
+            # ZIP: scripts + segment MP3s (no full_episode.mp3)
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
                 z.writestr("scripts/topic.txt", topic)
