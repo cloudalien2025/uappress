@@ -307,8 +307,9 @@ def tts_to_wav(text: str, delivery_instructions: str, speed: float, out_wav: str
         concat_wavs(wav_parts, out_wav)
         
 # ============================
-# PART 2/3 — Generic continuity + anti-repetition (episode-agnostic)
-# ============================        
+# PART 2/3 — Continuity Engine + Prompts + Episode Setup UI
+# ============================
+
 # ----------------------------
 # Generic continuity + anti-repetition (episode-agnostic)
 # ----------------------------
@@ -346,11 +347,9 @@ def extract_keyphrases(text: str, max_phrases: int = 24) -> List[str]:
     if not text:
         return []
 
-    # Capitalized phrases: "Phoenix Lights", "National Guard", "USS Nimitz"
     caps = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4})\b", text)
     caps = [c.strip() for c in caps if len(c.strip()) >= 4]
 
-    # Distinctive tokens (frequency)
     tokens = [normalize_token(x) for x in re.findall(r"[A-Za-z][A-Za-z'\-]{2,}", text)]
     tokens = [t for t in tokens if t and t not in STOPWORDS and not t.isdigit()]
 
@@ -361,7 +360,6 @@ def extract_keyphrases(text: str, max_phrases: int = 24) -> List[str]:
     top_tokens = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:18]
     top_tokens = [t for t, n in top_tokens if n >= 2]
 
-    # De-dupe, preserve order
     seen = set()
     out: List[str] = []
     for p in caps + top_tokens:
@@ -383,7 +381,7 @@ def build_continuity_rules(introduced: List[str], central_question: str) -> str:
     introduced_block = ", ".join(introduced) if introduced else "(none detected yet)"
     return f"""
 CONTINUITY RULE (NON-NEGOTIABLE):
-This chapter assumes the listener has heard everything before it.
+This episode is linear. The listener remembers prior segments.
 
 DO NOT:
 - restate the premise, background, or the initial incident
@@ -395,8 +393,7 @@ DO NOT:
 NAMING RULE (CRITICAL):
 - First appearance of a person in the entire episode: FULL NAME + ROLE + why they matter (one tight sentence).
 - After first appearance: use LAST NAME ONLY.
-- Do NOT repeat roles, titles, or background in later chapters.
-- Assume the listener remembers.
+- Do NOT repeat roles, titles, or background later.
 
 Already introduced (auto-extracted from prior text):
 {introduced_block}
@@ -415,7 +412,7 @@ Central Question:
 # Streamlit state (single source of truth)
 # ----------------------------
 def ensure_state():
-    st.session_state.setdefault("outline", [])            # list[dict]
+    st.session_state.setdefault("outline", [])
     st.session_state.setdefault("chapter_count", 0)
     st.session_state.setdefault("built", None)
     st.session_state.setdefault("topic", "Roswell UFO Incident")
@@ -429,15 +426,10 @@ ensure_state()
 
 
 def text_key(kind: str, idx: int = 0) -> str:
-    # kind in {"intro", "chapter", "outro"}
     return f"text::{kind}::{idx}"
 
 
 def ensure_text_key(kind: str, idx: int = 0, default: str = "") -> str:
-    """
-    Only initializes state if missing.
-    Never overwrites widget-managed keys.
-    """
     k = text_key(kind, idx)
     st.session_state.setdefault(k, default or "")
     return k
@@ -486,8 +478,8 @@ REQUIREMENTS:
   - what new uncertainty it created
 - Beats should be chronological when possible
 - Separate: contemporaneous facts vs official statements vs later testimony vs disputed claims
-- Avoid recap beats (no 'as we discussed', no resetting the timeline)
-- Ensure key participants appear early in the outline so the listener isn’t lost
+- Avoid recap beats and structural narration
+- Ensure key participants appear early in the outline
 
 Return ONLY valid JSON with this exact shape:
 {{
@@ -520,16 +512,16 @@ NOTES:
 
 INTRO REQUIREMENTS:
 - 60–90 seconds spoken
-- Open with a specific moment/statement/decision that instantly raises doubt
+- Start inside a real moment of doubt (statement, reversal, decision, phone call, briefing, memo, headline)
 - Establish stakes: credibility, secrecy, institutional self-protection
-- Briefly preview what listeners will hear (without listing chapter numbers)
+- Do NOT announce structure or chapters
 
 MANDATORY: KEY PLAYERS (ONE-TIME WHO’S WHO)
 - Include a tight key-players rundown in 2–4 sentences.
 - Each player gets: NAME + ROLE + why they matter (7–12 words).
 - Keep it brisk and intriguing; do NOT do biography.
-- After this introduction, assume the listener remembers these individuals.
-- Later chapters may use LAST NAMES only, with no redefinition.
+- After this, assume the listener remembers these individuals.
+- Later references should use LAST NAMES only, with no redefinition.
 
 Then:
 - State the Central Question explicitly near the end.
@@ -569,15 +561,18 @@ OUTRO REQUIREMENTS:
 - 60–90 seconds spoken
 - State what can be known vs what cannot be verified
 - Emphasize institutional consequence (trust, credibility, precedent), not sensational mystery
-- End with a powerful, thoughtful final line (not cheesy)
-- Include sponsor mention again (premium, natural):
-  - Sponsored by OPA Nutrition
-  - Mention premium wellness supplements that support focus, clarity, and daily performance
-  - Mention: opanutrition.com
-- Engagement CTA:
-  - Ask for comments: where they’re listening from
-  - Ask what case/topic to cover next
-  - Ask to like + subscribe
+- Do NOT announce structure or chapters
+- End with a clean, documentary final line (not cheesy)
+
+Sponsor mention again:
+- Sponsored by OPA Nutrition
+- Mention premium wellness supplements that support focus, clarity, and daily performance
+- Mention: opanutrition.com
+
+Engagement CTA:
+- Ask where they’re listening from
+- Ask what case/topic to cover next
+- Ask to like + subscribe
 
 Return ONLY the outro narration text. No headings.
 """.strip()
@@ -608,6 +603,21 @@ MANDATORY (CHAPTER 1 ONLY): KEY PLAYERS LOCK-IN
 - No biographies. No recap. Just roles and why they matter.
 """.strip()
 
+    forbidden = """
+FORBIDDEN META-NARRATION (NON-NEGOTIABLE):
+Do NOT say or imply:
+- "In the next chapter" / "In the next section"
+- "In Chapter X"
+- "This chapter"
+- "We will" / "We’re going to"
+- "As we’ll see"
+- "As discussed earlier"
+
+Instead, end with a DOCUMENTARY HOOK:
+- 1–2 sentences that raise a question, reveal a new tension, or introduce a new document/witness
+- It must feel like a natural cut, not a roadmap
+""".strip()
+
     return f"""
 Write CHAPTER {chapter_index} of an audio-only investigative documentary (Watergate-style).
 
@@ -630,8 +640,8 @@ EPISODE NOTES:
 
 {cast_requirement}
 
-HANDOFF (last paragraph of previous segment — begin immediately after this):
-{prev_chapter_tail if prev_chapter_tail else "[No previous text available; start in medias res without repeating the premise]"}
+HANDOFF (begin immediately after this; do NOT restate earlier context):
+{prev_chapter_tail if prev_chapter_tail else "[No previous segment text available — start in medias res without repeating the premise]"}
 
 MUST COVER THESE BEATS (new material only):
 {beats_block}
@@ -641,7 +651,9 @@ MANDATORY CHAPTER SHAPE:
 2) New evidence/statement/action
 3) Why it mattered (institutional/human stakes)
 4) Reversal (what changes in understanding)
-5) Forward hook into next chapter (1–2 sentences)
+5) Documentary hook ending (no roadmap)
+
+{forbidden}
 
 OUTPUT:
 Return ONLY narration text. No headings, no bullet points.
@@ -727,7 +739,6 @@ if outline_btn:
         st.session_state.chapter_count = len(normalized)
         st.session_state.built = None
 
-        # Seed widget keys safely (init-only; no overwrites)
         ensure_text_key("intro", 0, "")
         for i in range(1, st.session_state.chapter_count + 1):
             ensure_text_key("chapter", i, "")
@@ -739,6 +750,7 @@ if st.session_state.outline:
     st.subheader("📑 Outline")
     for i, ch in enumerate(st.session_state.outline, 1):
         st.markdown(f"**{i}. {ch['title']}** ({ch['target_minutes']} min)")
+
 
 # ============================
 # PART 3/3 — Scripts + Audio + Downloads
