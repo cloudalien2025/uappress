@@ -235,9 +235,12 @@ def json_outline_from_model(prompt: str) -> dict:
 # Audio helpers
 # ----------------------------
 def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
+    # ffmpeg concat demuxer list file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for wp in wav_paths:
-            f.write(f"file '{wp.replace(\"'\", \"'\\\\''\")}'\n")
+            # Escape single quotes for ffmpeg concat list format
+            escaped = wp.replace("'", "'\\''")
+            f.write("file '{}'\n".format(escaped))
         list_path = f.name
 
     try:
@@ -247,8 +250,7 @@ def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
             os.remove(list_path)
         except Exception:
             pass
-
-
+            
 def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
     run_ffmpeg([FFMPEG, "-y", "-i", wav_path, "-c:a", "libmp3lame", "-b:a", bitrate, mp3_path])
 
