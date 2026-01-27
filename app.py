@@ -10,6 +10,12 @@
 # - Uses ffmpeg (bundled via imageio_ffmpeg) for concat + music mix
 # - Fixes Streamlit state sync so generated text ALWAYS appears
 # - FIX: avoids StreamlitAPIException by never assigning to widget-owned keys after widget creation
+#
+# PATCH (this update):
+# - Adds "Investigative (Watergate)" Script Mode hardwired into the studio
+# - Requires a Central Question in Investigative mode
+# - Forces reversal-driven chapter structure + evidentiary discipline
+# - Keeps Standard Documentary mode intact
 
 import io
 import os
@@ -19,7 +25,7 @@ import time
 import zipfile
 import tempfile
 import subprocess
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import streamlit as st
 from openai import OpenAI
@@ -55,21 +61,42 @@ DEFAULT_MUSIC_PATH = "/mnt/data/dark-ambient-soundscape-music-409350.mp3"
 
 
 # ----------------------------
+# Investigative Documentary Mode (Watergate-style)
+# ----------------------------
+INVESTIGATIVE_SYSTEM = """
+You are a serious investigative documentary writer working in the tradition of Watergate-era reporting, the Pentagon Papers, and Frontline.
+
+This is not a UFO hype piece, speculative essay, or recap explainer.
+
+Your job is to investigate institutional behavior, credibility, and power, using the incident only as the factual setting.
+
+Write for an intelligent, skeptical audience. Use restraint, precision, and evidentiary discipline.
+""".strip()
+
+
+def is_investigative_mode(mode: str) -> bool:
+    return (mode or "").strip().lower().startswith("investigative")
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
 def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return p.returncode, p.stdout, p.stderr
 
+
 def run_ffmpeg(cmd: List[str]) -> None:
     code, out, err = run_cmd(cmd)
     if code != 0:
         raise RuntimeError(f"ffmpeg failed:\n{err[-4000:]}")
 
+
 def clean_filename(text: str) -> str:
     text = re.sub(r"[^\w\s\-]", "", text).strip()
     text = re.sub(r"\s+", "_", text)
     return (text.lower()[:80] or "episode")
+
 
 def chunk_text(text: str, max_chars: int = 3200) -> List[str]:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -92,6 +119,7 @@ def chunk_text(text: str, max_chars: int = 3200) -> List[str]:
         chunks.append("\n\n".join(buf))
     return chunks
 
+
 # --- PATCH: sanitize invisible Unicode control chars before TTS ---
 def sanitize_for_tts(text: str) -> str:
     """
@@ -107,6 +135,7 @@ def sanitize_for_tts(text: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 # --- END PATCH ---
+
 
 # --- PATCH: strip directive text so TTS never reads it aloud ---
 def strip_tts_directives(text: str) -> str:
@@ -140,6 +169,7 @@ def strip_tts_directives(text: str) -> str:
     return t.strip()
 # --- END PATCH ---
 
+
 def extract_json_object(text: str) -> dict:
     """
     Robustly extract a JSON object from a model response.
@@ -164,13 +194,24 @@ def extract_json_object(text: str) -> dict:
         raise ValueError("Could not find a JSON object in the response.")
     return json.loads(m2.group(1))
 
-def safe_chat(prompt: str, temperature: float = 0.4, tries: int = 2) -> str:
+
+def safe_chat(
+    prompt: str,
+    temperature: float = 0.4,
+    tries: int = 2,
+    system: Optional[str] = None,
+) -> str:
     last_err = None
     for _ in range(tries):
         try:
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+
             r = client.chat.completions.create(
                 model=SCRIPT_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 temperature=temperature,
             )
             return (r.choices[0].message.content or "").strip()
@@ -179,17 +220,19 @@ def safe_chat(prompt: str, temperature: float = 0.4, tries: int = 2) -> str:
             time.sleep(0.6)
     raise RuntimeError(f"Chat request failed: {last_err}")
 
-def json_outline_from_model(prompt: str) -> dict:
+
+def json_outline_from_model(prompt: str, system: Optional[str] = None) -> dict:
     """
     Attempts to get valid JSON reliably. If parsing fails, retries with a stricter prompt.
     """
-    content = safe_chat(prompt, temperature=0.25, tries=2)
+    content = safe_chat(prompt, temperature=0.25, tries=2, system=system)
     try:
         return extract_json_object(content)
     except Exception:
         stricter = prompt + "\n\nIMPORTANT: Return ONLY valid JSON. No prose, no markdown, no code fences."
-        content2 = safe_chat(stricter, temperature=0.15, tries=2)
+        content2 = safe_chat(stricter, temperature=0.15, tries=2, system=system)
         return extract_json_object(content2)
+
 
 def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
     # ffmpeg concat demuxer list file
@@ -213,6 +256,7 @@ def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
         except Exception:
             pass
 
+
 def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
     cmd = [
         FFMPEG, "-y",
@@ -222,6 +266,7 @@ def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
         mp3_path,
     ]
     run_ffmpeg(cmd)
+
 
 def get_audio_duration_seconds(path: str) -> float:
     """
@@ -236,6 +281,7 @@ def get_audio_duration_seconds(path: str) -> float:
     mm = int(m.group(2))
     ss = float(m.group(3))
     return hh * 3600 + mm * 60 + ss
+
 
 def mix_music_under_voice(
     voice_wav: str,
@@ -273,9 +319,13 @@ def mix_music_under_voice(
     ]
     run_ffmpeg(cmd)
 
+
 def tts_to_wav(text: str, delivery_instructions: str, speed: float, out_wav: str) -> None:
     """
     Generates multiple short WAV chunks via OpenAI TTS, then concatenates into one WAV.
+
+    NOTE: delivery_instructions + speed are currently UI controls for future expansion;
+    this function keeps signature stable.
     """
     chunks = chunk_text(text, max_chars=3200)
     wav_parts: List[str] = []
@@ -311,11 +361,20 @@ def ensure_state():
     st.session_state.setdefault("topic", "Roswell UFO Incident")
     st.session_state.setdefault("last_outline_params", None)
 
+    # --- NEW: investigative mode state ---
+    st.session_state.setdefault("script_mode", "Investigative (Watergate)")
+    st.session_state.setdefault(
+        "central_question",
+        "Why did official explanations for this incident shift over time—and what did each version protect?"
+    )
+
 ensure_state()
+
 
 def text_key(kind: str, idx: int = 0) -> str:
     # kind in {"intro", "chapter", "outro"}
     return f"text::{kind}::{idx}"
+
 
 def ensure_text_key(kind: str, idx: int = 0, default: str = "") -> str:
     """
@@ -327,6 +386,7 @@ def ensure_text_key(kind: str, idx: int = 0, default: str = "") -> str:
     st.session_state.setdefault(k, default or "")
     return k
 
+
 def get_text(kind: str, idx: int = 0) -> str:
     return st.session_state.get(text_key(kind, idx), "")
 
@@ -334,8 +394,33 @@ def get_text(kind: str, idx: int = 0) -> str:
 # ----------------------------
 # Prompt builders
 # ----------------------------
-def prompt_outline(topic: str, total_minutes: int, chapter_minutes: int, global_style: str, episode_notes: str) -> str:
+def prompt_outline(
+    topic: str,
+    total_minutes: int,
+    chapter_minutes: int,
+    global_style: str,
+    episode_notes: str,
+    script_mode: str,
+    central_question: str,
+) -> str:
     chapters = max(6, total_minutes // chapter_minutes)
+
+    investigative_block = ""
+    if is_investigative_mode(script_mode):
+        investigative_block = f"""
+INVESTIGATIVE MODE (WATERGATE-STYLE) — NON-NEGOTIABLE:
+Central Question:
+{central_question}
+
+Each chapter MUST create a reversal:
+- What was believed at that moment
+- What evidence/statement disrupted it
+- Why the disruption mattered to people/institutions
+- What new uncertainty it created
+
+Do NOT plan "background chapters." Every chapter advances the investigation.
+""".strip()
+
     return f"""
 Create an outline for an audio-only investigative documentary.
 
@@ -354,16 +439,19 @@ GLOBAL STYLE (must follow):
 EPISODE-SPECIFIC NOTES:
 {episode_notes}
 
+{investigative_block}
+
 REQUIREMENTS:
 - Create exactly {chapters} chapters
 - Each chapter must include:
   - title (short, cinematic but not hype)
   - target_minutes (integer)
-  - beats (5–8 bullet beats; each beat is a single sentence)
+  - beats (6–10 bullet beats; each beat is a single sentence)
 - Beats should be chronological when possible
-- Separate: established facts vs claims vs theories
+- Separate: established facts vs official statements vs later claims vs disputed assertions
 - No sensationalism, no jokes
 - Keep a strong narrative arc: hook → evidence → conflict → implications → unresolved questions
+- Avoid recap beats (no "as we discussed" / no resetting the timeline)
 
 Return ONLY valid JSON with this exact shape:
 {{
@@ -377,9 +465,27 @@ Return ONLY valid JSON with this exact shape:
 }}
 """.strip()
 
-def prompt_intro(topic: str, global_style: str, episode_notes: str) -> str:
+
+def prompt_intro(
+    topic: str,
+    global_style: str,
+    episode_notes: str,
+    script_mode: str,
+    central_question: str,
+) -> str:
+    investigative_block = ""
+    if is_investigative_mode(script_mode):
+        investigative_block = f"""
+INVESTIGATIVE INTRO REQUIREMENTS (WATERGATE FEEL):
+- Open with a specific moment/statement/decision that instantly raises doubt.
+- Establish stakes: credibility, secrecy, institutional self-protection.
+- Present the Central Question explicitly near the end of the intro.
+Central Question:
+{central_question}
+""".strip()
+
     return f"""
-Write an INTRO for an audio-only investigative documentary.
+Write an INTRO for an audio-only documentary.
 
 TOPIC:
 {topic}
@@ -389,6 +495,8 @@ STYLE (must follow):
 
 NOTES:
 {episode_notes}
+
+{investigative_block}
 
 INTRO REQUIREMENTS:
 - 60–90 seconds spoken
@@ -407,9 +515,27 @@ INTRO REQUIREMENTS:
 Return ONLY the intro narration text. No headings.
 """.strip()
 
-def prompt_outro(topic: str, global_style: str, episode_notes: str) -> str:
+
+def prompt_outro(
+    topic: str,
+    global_style: str,
+    episode_notes: str,
+    script_mode: str,
+    central_question: str,
+) -> str:
+    investigative_block = ""
+    if is_investigative_mode(script_mode):
+        investigative_block = f"""
+INVESTIGATIVE OUTRO REQUIREMENTS:
+- Revisit the Central Question.
+- State what can be known vs what cannot be verified.
+- Emphasize institutional consequence (trust, credibility, precedent), not sensational mystery.
+Central Question:
+{central_question}
+""".strip()
+
     return f"""
-Write an OUTRO for an audio-only investigative documentary.
+Write an OUTRO for an audio-only documentary.
 
 TOPIC:
 {topic}
@@ -419,6 +545,8 @@ STYLE (must follow):
 
 NOTES:
 {episode_notes}
+
+{investigative_block}
 
 OUTRO REQUIREMENTS:
 - 60–90 seconds spoken
@@ -437,6 +565,7 @@ OUTRO REQUIREMENTS:
 Return ONLY the outro narration text. No headings.
 """.strip()
 
+
 def prompt_chapter(
     topic: str,
     chapter_title: str,
@@ -444,11 +573,24 @@ def prompt_chapter(
     beats: List[str],
     global_style: str,
     episode_notes: str,
+    script_mode: str,
+    central_question: str,
 ) -> str:
     words = int(target_minutes * 145)
     beats_block = "\n".join([f"- {b}" for b in beats]) if beats else "- (No beats provided)"
+
+    investigative_block = ""
+    if is_investigative_mode(script_mode):
+        investigative_block = f"""
+INVESTIGATIVE CHAPTER RULES (WATERGATE-STYLE):
+- This chapter must move forward only; do NOT recap earlier chapters.
+- The chapter must produce at least one clear reversal in understanding.
+- Keep the Central Question alive (do not answer it early):
+{central_question}
+""".strip()
+
     return f"""
-Write a single chapter of an audio-only investigative documentary.
+Write a single chapter of an audio-only documentary.
 
 TOPIC:
 {topic}
@@ -464,6 +606,8 @@ STYLE (must follow):
 
 EPISODE NOTES:
 {episode_notes}
+
+{investigative_block}
 
 MUST COVER THESE BEATS:
 {beats_block}
@@ -495,6 +639,27 @@ with colB:
     total_minutes = st.slider("Total length (minutes)", 30, 180, 90, 5)
     chapter_minutes = st.slider("Minutes per chapter", 5, 20, 10, 1)
 
+st.subheader("Script Mode")
+
+script_mode = st.radio(
+    "Choose script mode",
+    ["Investigative (Watergate)", "Standard Documentary"],
+    index=0,
+    horizontal=True,
+)
+st.session_state.script_mode = script_mode
+
+central_question = st.text_area(
+    "Central Question (required for Investigative mode)",
+    value=st.session_state.central_question,
+    height=90,
+    help="Example: Why did official explanations shift over time—and what did each version protect?"
+)
+st.session_state.central_question = central_question
+
+if is_investigative_mode(script_mode) and not central_question.strip():
+    st.warning("Investigative mode requires a Central Question. Add one before generating the outline.")
+
 global_style = st.text_area(
     "Global style instructions",
     value=(
@@ -519,9 +684,14 @@ episode_notes = st.text_area(
 
 outline_btn = st.button("Generate Chapter Outline", type="primary")
 if outline_btn:
+    if is_investigative_mode(script_mode) and not central_question.strip():
+        st.error("Central Question is required for Investigative mode.")
+        st.stop()
+
     with st.spinner("Creating outline…"):
         data = json_outline_from_model(
-            prompt_outline(topic, total_minutes, chapter_minutes, global_style, episode_notes)
+            prompt_outline(topic, total_minutes, chapter_minutes, global_style, episode_notes, script_mode, central_question),
+            system=INVESTIGATIVE_SYSTEM if is_investigative_mode(script_mode) else None,
         )
         chapters_list = data.get("chapters", [])
 
@@ -536,7 +706,7 @@ if outline_btn:
             if not isinstance(beats, list):
                 beats = []
             beats = [str(b).strip() for b in beats if str(b).strip()]
-            normalized.append({"title": title, "target_minutes": tmin, "beats": beats[:10]})
+            normalized.append({"title": title, "target_minutes": tmin, "beats": beats[:12]})
 
         st.session_state.outline = normalized
         st.session_state.chapter_count = len(normalized)
@@ -571,8 +741,17 @@ left, right = st.columns([1, 1])
 
 with left:
     if st.button("Generate Intro", type="secondary", disabled=not st.session_state.outline):
+        if is_investigative_mode(st.session_state.script_mode) and not st.session_state.central_question.strip():
+            st.error("Central Question is required for Investigative mode.")
+            st.stop()
+
         with st.spinner("Writing intro…"):
-            intro_text = safe_chat(prompt_intro(topic, global_style, episode_notes), temperature=0.55, tries=2)
+            intro_text = safe_chat(
+                prompt_intro(topic, global_style, episode_notes, st.session_state.script_mode, st.session_state.central_question),
+                temperature=0.55,
+                tries=2,
+                system=INVESTIGATIVE_SYSTEM if is_investigative_mode(st.session_state.script_mode) else None,
+            )
             # Safe: happens before the widget is created later in this run
             st.session_state[text_key("intro", 0)] = intro_text
             st.session_state.built = None
@@ -580,8 +759,17 @@ with left:
 
 with right:
     if st.button("Generate Outro", type="secondary", disabled=not st.session_state.outline):
+        if is_investigative_mode(st.session_state.script_mode) and not st.session_state.central_question.strip():
+            st.error("Central Question is required for Investigative mode.")
+            st.stop()
+
         with st.spinner("Writing outro…"):
-            outro_text = safe_chat(prompt_outro(topic, global_style, episode_notes), temperature=0.55, tries=2)
+            outro_text = safe_chat(
+                prompt_outro(topic, global_style, episode_notes, st.session_state.script_mode, st.session_state.central_question),
+                temperature=0.55,
+                tries=2,
+                system=INVESTIGATIVE_SYSTEM if is_investigative_mode(st.session_state.script_mode) else None,
+            )
             st.session_state[text_key("outro", 0)] = outro_text
             st.session_state.built = None
         st.success("Outro generated.")
@@ -617,12 +805,26 @@ if st.session_state.get("_clear_chapters_requested"):
     st.success("Chapters cleared.")
 
 if gen_all and st.session_state.outline:
+    if is_investigative_mode(st.session_state.script_mode) and not st.session_state.central_question.strip():
+        st.error("Central Question is required for Investigative mode.")
+        st.stop()
+
     with st.spinner("Writing all chapters…"):
         for i, ch in enumerate(st.session_state.outline, 1):
             txt = safe_chat(
-                prompt_chapter(topic, ch["title"], ch["target_minutes"], ch["beats"], global_style, episode_notes),
+                prompt_chapter(
+                    topic,
+                    ch["title"],
+                    ch["target_minutes"],
+                    ch["beats"],
+                    global_style,
+                    episode_notes,
+                    st.session_state.script_mode,
+                    st.session_state.central_question,
+                ),
                 temperature=0.6,
                 tries=2,
+                system=INVESTIGATIVE_SYSTEM if is_investigative_mode(st.session_state.script_mode) else None,
             )
             st.session_state[text_key("chapter", i)] = txt
         st.session_state.built = None
@@ -635,11 +837,25 @@ if st.session_state.outline:
             with cc1:
                 st.caption(f"Target: ~{ch['target_minutes']} min")
                 if st.button(f"Generate Chapter {i}", key=f"btn_gen_ch_{i}"):
+                    if is_investigative_mode(st.session_state.script_mode) and not st.session_state.central_question.strip():
+                        st.error("Central Question is required for Investigative mode.")
+                        st.stop()
+
                     with st.spinner(f"Writing Chapter {i}…"):
                         txt = safe_chat(
-                            prompt_chapter(topic, ch["title"], ch["target_minutes"], ch["beats"], global_style, episode_notes),
+                            prompt_chapter(
+                                topic,
+                                ch["title"],
+                                ch["target_minutes"],
+                                ch["beats"],
+                                global_style,
+                                episode_notes,
+                                st.session_state.script_mode,
+                                st.session_state.central_question,
+                            ),
                             temperature=0.6,
                             tries=2,
+                            system=INVESTIGATIVE_SYSTEM if is_investigative_mode(st.session_state.script_mode) else None,
                         )
                         st.session_state[text_key("chapter", i)] = txt
                         st.session_state.built = None
@@ -684,6 +900,7 @@ fade_s = st.slider("Music fade in/out (seconds)", 2, 12, 6, 1)
 
 music_file = st.file_uploader("Upload background music (MP3/WAV)", type=["mp3", "wav"])
 
+
 def has_any_script() -> bool:
     if get_text("intro", 0).strip():
         return True
@@ -693,6 +910,7 @@ def has_any_script() -> bool:
     if get_text("outro", 0).strip():
         return True
     return False
+
 
 build_disabled = (not st.session_state.outline) or (not has_any_script())
 build = st.button("Generate Audio + Export", type="primary", disabled=build_disabled)
@@ -768,6 +986,8 @@ if build:
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
                 z.writestr("scripts/topic.txt", topic)
+                z.writestr("scripts/script_mode.txt", st.session_state.script_mode)
+                z.writestr("scripts/central_question.txt", st.session_state.central_question)
                 z.writestr("scripts/intro.txt", get_text("intro", 0))
 
                 for i in range(1, st.session_state.chapter_count + 1):
