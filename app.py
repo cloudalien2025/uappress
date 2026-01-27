@@ -751,9 +751,8 @@ if st.session_state.outline:
     for i, ch in enumerate(st.session_state.outline, 1):
         st.markdown(f"**{i}. {ch['title']}** ({ch['target_minutes']} min)")
 
-
 # ============================
-# PART 3/3 — Scripts + Audio + Downloads
+# PART 3/3 — Scripts + Audio + Downloads (with Anti-Roadmap Patch)
 # ============================
 
 # ----------------------------
@@ -781,6 +780,9 @@ with left:
                 ),
                 temperature=0.55,
             )
+            # ✅ Anti-roadmap cleanup
+            intro_text = strip_meta_narration(intro_text)
+
             st.session_state[text_key("intro", 0)] = intro_text
             st.session_state.built = None
         st.success("Intro generated.")
@@ -797,6 +799,9 @@ with right:
                 ),
                 temperature=0.55,
             )
+            # ✅ Anti-roadmap cleanup
+            outro_text = strip_meta_narration(outro_text)
+
             st.session_state[text_key("outro", 0)] = outro_text
             st.session_state.built = None
         st.success("Outro generated.")
@@ -817,7 +822,7 @@ with c1:
 with c2:
     clear_all = st.button("Clear Chapters")
 with c3:
-    st.caption("Continuity is enforced automatically. Intro/Chapter 1 introduces key players; later chapters reference last names only.")
+    st.caption("Continuity is enforced automatically. No book-style roadmap narration.")
 
 if clear_all:
     st.session_state["_clear_chapters_requested"] = True
@@ -835,11 +840,9 @@ if st.session_state.get("_clear_chapters_requested"):
 # ----------------------------
 if gen_all and st.session_state.outline:
     with st.spinner("Writing all chapters…"):
-        # Build introduced list from Intro (if present) so the naming rules work immediately
+        # Build introduced list from Intro so naming rules work immediately
         introduced = extract_keyphrases(get_text("intro", 0))
 
-        # If intro is empty, we still want the model to avoid repeating the premise;
-        # entity list will grow as we generate chapters.
         for i, ch in enumerate(st.session_state.outline, 1):
             prev_tail = (
                 last_paragraph(get_text("intro", 0))
@@ -860,12 +863,15 @@ if gen_all and st.session_state.outline:
                     introduced_phrases=introduced,
                     chapter_index=i,
                 ),
-                temperature=0.45,  # lower temp reduces repetition
+                temperature=0.45,
             )
+
+            # ✅ Anti-roadmap cleanup
+            txt = strip_meta_narration(txt)
 
             st.session_state[text_key("chapter", i)] = txt
 
-            # Update introduced entities from everything so far (Intro + chapters generated)
+            # Update introduced entities from everything so far
             cumulative = (
                 get_text("intro", 0)
                 + "\n\n"
@@ -917,6 +923,10 @@ if st.session_state.outline:
                             ),
                             temperature=0.45,
                         )
+
+                        # ✅ Anti-roadmap cleanup
+                        txt = strip_meta_narration(txt)
+
                         st.session_state[text_key("chapter", i)] = txt
                         st.session_state.built = None
                     st.success(f"Chapter {i} generated.")
