@@ -231,7 +231,6 @@ def json_outline_from_model(prompt: str) -> dict:
         content2 = safe_chat(stricter, temperature=0.15, tries=2)
         return extract_json_object(content2)
 
-
 # ----------------------------
 # Audio helpers
 # ----------------------------
