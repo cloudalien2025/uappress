@@ -1054,18 +1054,23 @@ if build:
             # ZIP: scripts + segment MP3s (no full_episode.mp3)
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                z.writestr("scripts/topic.txt", topic)
-                z.writestr("scripts/central_question.txt", central_question)
-                z.writestr("scripts/intro.txt", get_text("intro", 0))
+            # ✅ Put metadata in a NON-script extension so video creator won't pair it
+            z.writestr("meta/episode_metadata.yaml", f"topic: {topic}\n"
+            f"central_question: {st.session_state.get('central_question','')}\n"
+            f"script_mode: {st.session_state.get('script_mode','')}\n")
 
-                for i in range(1, st.session_state.chapter_count + 1):
-                    title = st.session_state.outline[i - 1]["title"]
-                    z.writestr(f"scripts/chapter_{i:02d}_{clean_filename(title)}.txt", get_text("chapter", i))
+            # ✅ Only narration scripts go in scripts/
+            z.writestr("scripts/intro.txt", get_text("intro", 0))
 
-                z.writestr("scripts/outro.txt", get_text("outro", 0))
+           for i in range(1, st.session_state.chapter_count + 1):
+           title = st.session_state.outline[i - 1]["title"]
+           z.writestr(f"scripts/chapter_{i:02d}_{clean_filename(title)}.txt", get_text("chapter", i))
+           z.writestr("scripts/outro.txt", get_text("outro", 0))
 
-                for slug, b in per_segment_mp3.items():
-                    z.writestr(f"audio/{slug}.mp3", b)
+    # Audio (should match narration scripts)
+    for slug, b in per_segment_mp3.items():
+        z.writestr(f"audio/{slug}.mp3", b)
+
 
             zip_buf.seek(0)
             st.session_state.built = {"zip": zip_buf.getvalue(), "full_mp3": full_mp3_bytes}
