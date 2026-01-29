@@ -597,7 +597,7 @@ def has_any_script() -> bool:
     return False
 
 # ============================
-# PART 3/4 — Script Generation UI + Parsing + Box Population
+# PART 3/4 — Script Generation UI + Title-Injection (Auto) + Parsing + Box Population
 # ============================
 
 st.header("1️⃣ Script Creation")
@@ -623,22 +623,76 @@ with colB:
 st.divider()
 
 # ----------------------------
-# Master Prompt input
+# Title injection (AUTO) — makes Master Prompt "read" the Episode Title
+# ----------------------------
+def build_prompt_with_title_lock(*, episode_title: str, master_prompt: str) -> str:
+    """
+    Prepend a locked subject block that forces the model to anchor on the Episode Title.
+    This minimizes user work: you type title once, and it is always injected into the API prompt.
+    """
+    title = (episode_title or "").strip() or "Untitled Episode"
+    mp = (master_prompt or "").strip()
+
+    locked = f"""
+DOCUMENTARY SUBJECT (LOCKED)
+
+Title: {title}
+
+This documentary must investigate ONLY the subject implied by the title above.
+
+All narrative focus, evidence selection, chronology, and chapter framing
+must directly serve the investigation promised by this title.
+
+Do NOT rename the case.
+Do NOT broaden the scope beyond the title.
+Do NOT introduce parallel cases except where directly necessary
+to contextualize this specific investigation.
+""".strip()
+
+    if not mp:
+        return locked
+
+    return locked + "\n\n" + mp
+
+
+# ----------------------------
+# Master Prompt UI (Investigative Brief)
 # ----------------------------
 st.subheader("🧠 Master Prompt (Investigative Brief)")
+
+# IMPORTANT: set defaults BEFORE widgets exist (Streamlit-safe)
+st.session_state.setdefault("MASTER_PROMPT_INPUT", "")
+st.session_state.setdefault("_MASTER_PROMPT_SEEDED", False)
+
+# Auto-seed the prompt ONLY once if empty (minimize your work)
+# (Does not overwrite if you already typed anything)
+if (not st.session_state.get("MASTER_PROMPT_INPUT", "").strip()) and (not st.session_state.get("_MASTER_PROMPT_SEEDED", False)):
+    seed_title = (st.session_state.get("episode_title") or "").strip()
+    st.session_state["MASTER_PROMPT_INPUT"] = (
+        f"Investigate the case titled: {seed_title}\n\n"
+        "Focus on chronology, key witnesses, official statements, and contradictions.\n"
+        "Separate: documented facts vs firsthand testimony vs official explanations vs later reinterpretations.\n"
+        "Keep the tone calm, authoritative, and evidence-driven.\n"
+        "Avoid sensational language and avoid chapter roadmap narration."
+    ).strip()
+    st.session_state["_MASTER_PROMPT_SEEDED"] = True
 
 st.text_area(
     "Paste your investigative brief / case focus here",
     key="MASTER_PROMPT_INPUT",
-    height=220,
-    placeholder=(
-        "Example:\n"
-        "Focus on the Roswell Army Air Field press release, the rapid retraction, "
-        "the role of General Ramey, and how the official explanation evolved.\n\n"
-        "Emphasize institutional pressure, information control, and credibility risk."
-    ),
-    help="This is NOT narrated. It instructs the investigative direction only.",
+    height=240,
+    help="This is NOT narrated. It instructs the investigation only. The title is auto-injected into the API prompt.",
 )
+
+# Show what will be injected (optional preview)
+with st.expander("🔒 Preview: What the model will receive (Title Lock + Master Prompt)", expanded=False):
+    preview = build_prompt_with_title_lock(
+        episode_title=st.session_state.get("episode_title", ""),
+        master_prompt=st.session_state.get("MASTER_PROMPT_INPUT", ""),
+    )
+    st.text_area("Final prompt preview (read-only)", value=preview, height=240)
+
+st.divider()
 
 # ----------------------------
 # Generate Script Button
@@ -654,23 +708,33 @@ with gen_col1:
 
 with gen_col2:
     st.caption(
-        "One-shot generation using the locked Master Prompt.\n"
-        "Produces INTRO / CHAPTERS / OUTRO in a strict template."
+        "One-shot generation using your Master Prompt + an automatic Title Lock.\n"
+        "Output must be strict: INTRO / CHAPTER 1–N / OUTRO."
     )
 
 # ----------------------------
 # Script generation execution
 # ----------------------------
 if generate_script_btn:
+    if not st.session_state.get("episode_title", "").strip():
+        st.error("Episode title is required.")
+        st.stop()
+
     if not st.session_state.get("MASTER_PROMPT_INPUT", "").strip():
-        st.error("Master Prompt is required.")
+        st.error("Master Prompt is required (even a short brief is fine).")
         st.stop()
 
     with st.spinner("Generating long-form investigative script…"):
         try:
-            raw_script = generate_master_script_one_shot(
-                topic=st.session_state.get("episode_title", ""),
+            # ✅ AUTO-INJECT TITLE into the prompt sent to the model
+            final_master_prompt = build_prompt_with_title_lock(
+                episode_title=st.session_state.get("episode_title", ""),
                 master_prompt=st.session_state.get("MASTER_PROMPT_INPUT", ""),
+            )
+
+            raw_script = generate_master_script_one_shot(
+                topic=st.session_state.get("episode_title", ""),   # kept for backwards compatibility
+                master_prompt=final_master_prompt,                 # <- THIS is the important change
                 chapters=int(st.session_state.get("DEFAULT_CHAPTERS", 8)),
                 model=st.session_state.get("SCRIPT_MODEL", "gpt-4o-mini"),
             )
@@ -681,9 +745,8 @@ if generate_script_btn:
             # Detect chapter count from headings
             chapter_map = detect_chapters_and_titles(raw_script)
             detected_n = max(chapter_map.keys()) if chapter_map else 0
-
             if detected_n <= 0:
-                raise ValueError("No CHAPTER headings detected in generated script.")
+                raise ValueError("No CHAPTER headings detected in generated script. The model must output strict headings.")
 
             # Reset script boxes safely
             st.session_state["chapter_count"] = detected_n
@@ -692,14 +755,27 @@ if generate_script_btn:
             # Parse script and populate boxes
             parsed = parse_master_script(raw_script, detected_n)
 
-            st.session_state[text_key("intro", 0)] = parsed.get("intro", "").strip()
+            st.session_state[text_key("intro", 0)] = (parsed.get("intro", "") or "").strip()
             for i in range(1, detected_n + 1):
                 st.session_state[text_key("chapter", i)] = (
-                    parsed.get("chapters", {}).get(i, "").strip()
-                )
-            st.session_state[text_key("outro", 0)] = parsed.get("outro", "").strip()
+                    (parsed.get("chapters", {}) or {}).get(i, "") or ""
+                ).strip()
+            st.session_state[text_key("outro", 0)] = (parsed.get("outro", "") or "").strip()
 
-            st.success(f"Script generated and loaded ({detected_n} chapters).")
+            # Helpful warnings if anything is empty
+            missing = []
+            if not st.session_state[text_key("intro", 0)].strip():
+                missing.append("INTRO")
+            for i in range(1, detected_n + 1):
+                if not st.session_state[text_key("chapter", i)].strip():
+                    missing.append(f"CHAPTER {i}")
+            if not st.session_state[text_key("outro", 0)].strip():
+                missing.append("OUTRO")
+
+            if missing:
+                st.warning("Generated script loaded, but these sections were empty/missing: " + ", ".join(missing))
+            else:
+                st.success(f"Script generated and loaded (Intro + {detected_n} chapters + Outro).")
 
         except Exception as e:
             st.error(str(e))
@@ -748,13 +824,16 @@ st.text_area(
 # Safety / reset controls
 # ----------------------------
 st.divider()
-reset_col1, reset_col2 = st.columns([1, 3])
+reset_col1, reset_col2, reset_col3 = st.columns([1, 1, 2])
 
 with reset_col1:
     clear_script_btn = st.button("Clear Script")
 
 with reset_col2:
-    st.caption("Clears Intro, Chapters, and Outro (does not affect audio builds).")
+    clear_master_btn = st.button("Clear Master Prompt")
+
+with reset_col3:
+    st.caption("Clears text boxes (does not affect any already-built audio).")
 
 if clear_script_btn:
     st.session_state[text_key("intro", 0)] = ""
@@ -763,6 +842,12 @@ if clear_script_btn:
     st.session_state[text_key("outro", 0)] = ""
     st.session_state["chapter_count"] = 0
     st.success("Script cleared.")
+
+if clear_master_btn:
+    st.session_state["MASTER_PROMPT_INPUT"] = ""
+    st.session_state["_MASTER_PROMPT_SEEDED"] = False
+    st.success("Master Prompt cleared.")
+
 
 # ============================
 # PART 4/4 — Audio Build (Per-Section + Full Episode) + Downloads + Final ZIP
