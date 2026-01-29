@@ -1,5 +1,5 @@
 # ============================
-# PART 1/5 — Core Setup, Sidebar, Clients, FFmpeg, Text + Script Parsing Utilities
+# PART 1/4 — Core Setup, Sidebar, Clients, FFmpeg, Text + Script Parsing Utilities
 # ============================
 # app.py — UAPpress Documentary TTS Studio (Script → Audio) + OPTIONAL Master Prompt → Script
 #
