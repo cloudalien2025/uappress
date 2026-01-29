@@ -885,51 +885,77 @@ if st.session_state.outline:
 # ----------------------------
 st.header("2️⃣ Scripts")
 
-# Ensure keys exist BEFORE widgets are created
-reset_script_text_fields(st.session_state.chapter_count)
+# Ensure keys exist BEFORE widgets are created (safe even if chapter_count is 0)
+reset_script_text_fields(st.session_state.get("chapter_count", 0))
+
 
 # ----------------------------
-# Master Script Paste (Option A)
+# Master Script Paste (Strict Template → Fill Boxes)
 # ----------------------------
-def _normalize_heading_line(line: str) -> str:
-    return re.sub(r"\s+", " ", (line or "").strip()).upper()
+def _normalize_line(line: str) -> str:
+    return re.sub(r"\s+", " ", (line or "").strip())
+
+
+_CHAPTER_RE = re.compile(r"(?i)^\s*chapter\s+(\d+)\s*(?:[:\-–—]\s*(.*))?\s*$")
+
+
+def detect_chapters_and_titles(master_text: str) -> Dict[int, str]:
+    """
+    Detect CHAPTER N headings and optional titles from the heading line.
+
+    Examples supported:
+      CHAPTER 1
+      CHAPTER 1: The Calm Before
+      CHAPTER 1 - The Calm Before
+      Chapter 1 — The Calm Before
+
+    Returns: {1: "The Calm Before", 2: "", ...}
+    """
+    txt = (master_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    titles: Dict[int, str] = {}
+    for line in txt.split("\n"):
+        m = _CHAPTER_RE.match(line or "")
+        if not m:
+            continue
+        try:
+            n = int(m.group(1))
+        except Exception:
+            continue
+        title = (m.group(2) or "").strip()
+        titles[n] = title
+    return titles
 
 
 def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, object]:
     """
     Parse a single master script into intro / chapters / outro using strict headings.
 
-    Supported headings (case-insensitive):
+    Headings (case-insensitive):
       INTRO
-      CHAPTER 1: Title (title optional; colon optional)
-      CHAPTER 2
+      CHAPTER 1[: Title]
       ...
       OUTRO
 
-    IMPORTANT:
+    CRITICAL:
       - Heading lines are NOT included in returned narration text.
-      - Chapter titles are ignored for narration (structure only).
+      - Only the body under each heading is returned.
     """
     txt = (master_text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = txt.split("\n")
 
-    # Build indices of section starts
     intro_idx = None
     outro_idx = None
     chapter_idx: Dict[int, int] = {}
 
-    # Match "CHAPTER 3", "CHAPTER 3:", "CHAPTER 3 -", "CHAPTER 3: Title"
-    chapter_re = re.compile(r"(?i)^\s*chapter\s+(\d+)\s*(?:[:\-–—].*)?$")
-
     for i, raw in enumerate(lines):
-        h = _normalize_heading_line(raw)
+        h = _normalize_line(raw).upper()
         if h == "INTRO":
             intro_idx = i
             continue
         if h == "OUTRO":
             outro_idx = i
             continue
-        m = chapter_re.match(raw or "")
+        m = _CHAPTER_RE.match(raw or "")
         if m:
             try:
                 n = int(m.group(1))
@@ -937,58 +963,44 @@ def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, o
             except Exception:
                 pass
 
-    # Helper to slice content between headings
-    def slice_block(start_i: int, end_i: int) -> str:
+    # Collect all heading positions, sorted
+    positions: List[int] = []
+    if intro_idx is not None:
+        positions.append(intro_idx)
+    if outro_idx is not None:
+        positions.append(outro_idx)
+    for _, idx in chapter_idx.items():
+        positions.append(idx)
+    positions = sorted(set(positions))
+
+    # Map each heading line index -> next heading line index (or end)
+    next_pos: Dict[int, int] = {}
+    for k in range(len(positions)):
+        cur = positions[k]
+        nxt = positions[k + 1] if (k + 1) < len(positions) else len(lines)
+        next_pos[cur] = nxt
+
+    def slice_block(start_i: Optional[int]) -> str:
         if start_i is None:
             return ""
-        # exclude heading line itself
-        body = "\n".join(lines[start_i + 1 : end_i]).strip()
+        end_i = next_pos.get(start_i, len(lines))
+        body = "\n".join(lines[start_i + 1 : end_i]).strip()  # EXCLUDES heading line
         body = re.sub(r"\n{3,}", "\n\n", body).strip()
         return body
 
-    # Determine ordered boundaries for each section
-    # Collect all heading positions to compute next boundary
-    positions: List[Tuple[str, int]] = []
-    if intro_idx is not None:
-        positions.append(("INTRO", intro_idx))
-    if outro_idx is not None:
-        positions.append(("OUTRO", outro_idx))
-    for n, idx in chapter_idx.items():
-        positions.append((f"CHAPTER {n}", idx))
-    positions.sort(key=lambda x: x[1])
-
-    # Map from position index to next heading line index
-    next_pos: Dict[int, int] = {}
-    for k in range(len(positions)):
-        cur_line = positions[k][1]
-        nxt_line = positions[k + 1][1] if k + 1 < len(positions) else len(lines)
-        next_pos[cur_line] = nxt_line
-
     parsed: Dict[str, object] = {"intro": "", "outro": "", "chapters": {}}
+    parsed["intro"] = slice_block(intro_idx)
+    parsed["outro"] = slice_block(outro_idx)
 
-    # Intro
-    if intro_idx is not None:
-        parsed["intro"] = slice_block(intro_idx, next_pos.get(intro_idx, len(lines)))
-
-    # Outro
-    if outro_idx is not None:
-        parsed["outro"] = slice_block(outro_idx, next_pos.get(outro_idx, len(lines)))
-
-    # Chapters 1..N (strict template expectation)
     chapters_out: Dict[int, str] = {}
-    for n in range(1, max(0, expected_chapters) + 1):
-        idx = chapter_idx.get(n)
-        if idx is None:
-            chapters_out[n] = ""
-            continue
-        chapters_out[n] = slice_block(idx, next_pos.get(idx, len(lines)))
+    for n in range(1, expected_chapters + 1):
+        chapters_out[n] = slice_block(chapter_idx.get(n))
     parsed["chapters"] = chapters_out
     return parsed
 
 
-st.subheader("📌 Paste Full Script (Intro + Chapter 1–N + Outro)")
+st.subheader("📌 Paste Full Script (INTRO + CHAPTER 1–N + OUTRO)")
 
-# Keep the key stable across reruns
 st.session_state.setdefault("MASTER_SCRIPT_TEXT", "")
 
 master_cols = st.columns([3, 1])
@@ -996,22 +1008,31 @@ with master_cols[0]:
     st.text_area(
         "Master script",
         key="MASTER_SCRIPT_TEXT",
-        height=200,
+        height=220,
         placeholder=(
-            "Paste your full script here using headings:\n\n"
-            "INTRO\n...\n\n"
-            "CHAPTER 1: Title\n...\n\n"
-            "CHAPTER 2\n...\n\n"
-            "OUTRO\n..."
+            "Use this strict template:\n\n"
+            "INTRO\n"
+            "<intro narration...>\n\n"
+            "CHAPTER 1: Optional Title\n"
+            "<chapter 1 narration...>\n\n"
+            "CHAPTER 2\n"
+            "<chapter 2 narration...>\n\n"
+            "...\n\n"
+            "OUTRO\n"
+            "<outro narration...>\n"
         ),
         help=(
-            "Headings are structural only and will NOT be inserted into narration boxes or spoken in MP3.\n"
-            "Supported headings: INTRO, CHAPTER 1..N, OUTRO (case-insensitive)."
+            "Headings (INTRO / CHAPTER N / OUTRO) are STRUCTURE ONLY.\n"
+            "They will NOT be inserted into narration boxes and will NOT be spoken in MP3."
         ),
     )
 
 with master_cols[1]:
-    fill_btn = st.button("Fill Boxes from Paste", type="primary", disabled=not st.session_state.outline)
+    fill_btn = st.button(
+        "Fill Boxes from Paste",
+        type="primary",
+        disabled=not st.session_state.get("MASTER_SCRIPT_TEXT", "").strip(),
+    )
     clear_paste_btn = st.button("Clear Paste", type="secondary")
 
 if clear_paste_btn:
@@ -1019,45 +1040,72 @@ if clear_paste_btn:
     st.session_state.built = None
     st.rerun()
 
+
 if fill_btn:
     raw_master = st.session_state.get("MASTER_SCRIPT_TEXT", "")
     if not raw_master.strip():
         st.error("Paste a master script first.")
+        st.stop()
+
+    # 1) Detect how many chapters exist from headings
+    chapter_titles_map = detect_chapters_and_titles(raw_master)
+    detected_n = max(chapter_titles_map.keys()) if chapter_titles_map else 0
+
+    if detected_n <= 0:
+        st.error("No CHAPTER headings found. Use 'CHAPTER 1', 'CHAPTER 2', etc.")
+        st.stop()
+
+    # 2) Set chapter_count and create the session keys for boxes
+    st.session_state.chapter_count = detected_n
+    reset_script_text_fields(detected_n)
+
+    # 3) Build a lightweight, derived outline for existing UI + audio filename logic
+    #    (This is NOT a generated outline; it's extracted from your headings.)
+    derived_outline = []
+    for i in range(1, detected_n + 1):
+        title = (chapter_titles_map.get(i) or "").strip()
+        derived_outline.append(
+            {
+                "title": title if title else f"Chapter {i}",
+                "target_minutes": 10,   # harmless default; only shown as UI hint
+                "beats": [],            # empty because we are not generating an outline
+            }
+        )
+    st.session_state.outline = derived_outline
+
+    # 4) Parse sections and fill boxes (HEADINGS STRIPPED)
+    parsed = parse_master_script(raw_master, detected_n)
+
+    st.session_state[text_key("intro", 0)] = (parsed.get("intro") or "").strip()
+    chapters_map: Dict[int, str] = parsed.get("chapters", {}) or {}
+    for i in range(1, detected_n + 1):
+        st.session_state[text_key("chapter", i)] = (chapters_map.get(i) or "").strip()
+    st.session_state[text_key("outro", 0)] = (parsed.get("outro") or "").strip()
+
+    st.session_state.built = None
+
+    # 5) Helpful warnings (you said you’ll keep a strict template; this just flags blanks)
+    missing = []
+    if not st.session_state[text_key("intro", 0)].strip():
+        missing.append("INTRO")
+    for i in range(1, detected_n + 1):
+        if not st.session_state[text_key("chapter", i)].strip():
+            missing.append(f"CHAPTER {i}")
+    if not st.session_state[text_key("outro", 0)].strip():
+        missing.append("OUTRO")
+
+    if missing:
+        st.warning("Filled what I could, but these sections were empty/missing: " + ", ".join(missing))
     else:
-        parsed = parse_master_script(raw_master, st.session_state.chapter_count)
-
-        # Fill Intro/Outro/Chapters (HEADINGS ARE STRIPPED)
-        st.session_state[text_key("intro", 0)] = (parsed.get("intro") or "").strip()
-        chapters_map: Dict[int, str] = parsed.get("chapters", {}) or {}
-        for i in range(1, st.session_state.chapter_count + 1):
-            st.session_state[text_key("chapter", i)] = (chapters_map.get(i) or "").strip()
-        st.session_state[text_key("outro", 0)] = (parsed.get("outro") or "").strip()
-
-        st.session_state.built = None
-
-        # Soft validation feedback (strict template expected, but we still warn)
-        missing = []
-        if not st.session_state[text_key("intro", 0)].strip():
-            missing.append("INTRO")
-        for i in range(1, st.session_state.chapter_count + 1):
-            if not st.session_state[text_key("chapter", i)].strip():
-                missing.append(f"CHAPTER {i}")
-        if not st.session_state[text_key("outro", 0)].strip():
-            missing.append("OUTRO")
-
-        if missing:
-            st.warning("Parsed, but these sections were empty or missing: " + ", ".join(missing))
-        else:
-            st.success("All boxes filled from your master script (headings stripped).")
+        st.success(f"Boxes filled: Intro + {detected_n} chapters + Outro (headings stripped).")
 
 st.divider()
 
 # ----------------------------
-# Clear Chapters
+# Clear all script boxes (manual reset)
 # ----------------------------
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
-    # Keep this button slot but remove generation behavior
     st.caption("Paste → Fill Boxes above.")
 with c2:
     clear_all = st.button("Clear Chapters")
@@ -1065,23 +1113,18 @@ with c3:
     st.caption("Headings are structure-only and will NOT be spoken in MP3.")
 
 if clear_all:
-    st.session_state["_clear_chapters_requested"] = True
-    st.session_state.built = None
-    st.rerun()
-
-if st.session_state.get("_clear_chapters_requested"):
     st.session_state[text_key("intro", 0)] = ""
-    for i in range(1, st.session_state.chapter_count + 1):
+    for i in range(1, st.session_state.get("chapter_count", 0) + 1):
         st.session_state[text_key("chapter", i)] = ""
     st.session_state[text_key("outro", 0)] = ""
-    st.session_state["_clear_chapters_requested"] = False
+    st.session_state.built = None
     st.success("Intro, chapters, and outro cleared.")
 
 
 def has_any_script() -> bool:
     if get_text("intro", 0).strip():
         return True
-    for i in range(1, st.session_state.chapter_count + 1):
+    for i in range(1, st.session_state.get("chapter_count", 0) + 1):
         if get_text("chapter", i).strip():
             return True
     if get_text("outro", 0).strip():
@@ -1090,7 +1133,7 @@ def has_any_script() -> bool:
 
 
 # ----------------------------
-# Intro text box (manual editing allowed)
+# Intro box
 # ----------------------------
 st.subheader("Intro")
 st.text_area(
@@ -1103,29 +1146,35 @@ st.text_area(
 st.divider()
 
 # ----------------------------
-# Chapter boxes (NO generation; paste fills; manual edits allowed)
+# Chapter boxes (no generation; paste fills; manual edits allowed)
 # ----------------------------
-if st.session_state.outline:
-    for i, ch in enumerate(st.session_state.outline, 1):
-        with st.expander(f"Chapter {i}: {ch['title']}", expanded=(i == 1)):
-            cc1, cc2 = st.columns([1, 3])
+chapter_count = st.session_state.get("chapter_count", 0)
+outline = st.session_state.get("outline", [])
 
-            with cc1:
-                st.caption(f"Target: ~{ch['target_minutes']} min")
-                st.caption("Narration only (no 'CHAPTER X' headings).")
+if chapter_count > 0:
+    for i in range(1, chapter_count + 1):
+        # Title from derived outline if present
+        title = ""
+        try:
+            title = str(outline[i - 1].get("title", "")).strip()
+        except Exception:
+            title = ""
+        label = f"Chapter {i}: {title}" if title else f"Chapter {i}"
 
-            with cc2:
-                st.text_area(
-                    f"Chapter {i} text",
-                    key=text_key("chapter", i),
-                    height=320,
-                    placeholder="Filled from Master Script paste above (headings stripped). You can edit here.",
-                )
+        with st.expander(label, expanded=(i == 1)):
+            st.text_area(
+                f"Chapter {i} text",
+                key=text_key("chapter", i),
+                height=320,
+                placeholder="Filled from Master Script paste above (headings stripped). You can edit here.",
+            )
+else:
+    st.caption("Paste your master script above and click “Fill Boxes from Paste” to generate the boxes.")
 
 st.divider()
 
 # ----------------------------
-# Outro text box (manual editing allowed)
+# Outro box
 # ----------------------------
 st.subheader("Outro")
 st.text_area(
@@ -1139,146 +1188,4 @@ st.text_area(
 # Audio build
 # ----------------------------
 st.header("3️⃣ Create Audio (Onyx + Music)")
-
-tts_instructions = st.text_area(
-    "TTS delivery instructions",
-    value=(
-        "British-leaning neutral delivery if possible, but natural and not forced. "
-        "Calm, authoritative, restrained documentary narration. "
-        "Measured pace with subtle pauses. Crisp consonants."
-    ),
-    height=110,
-)
-
-speed = st.slider("Narration speed (guidance)", 0.85, 1.10, 1.00, 0.01)
-music_db = st.slider("Music volume (dB)", -35, -10, -24, 1)
-fade_s = st.slider("Music fade in/out (seconds)", 2, 12, 6, 1)
-
-music_file = st.file_uploader("Upload background music (MP3/WAV)", type=["mp3", "wav"])
-
-build_disabled = (not st.session_state.outline) or (not has_any_script())
-build = st.button("Generate Audio + Export", type="primary", disabled=build_disabled)
-
-if build:
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            # Choose music
-            chosen_music_path: Optional[str] = None
-            if music_file:
-                ext = ".mp3" if (music_file.type == "audio/mpeg") else ".wav"
-                chosen_music_path = os.path.join(td, "music_upload" + ext)
-                with open(chosen_music_path, "wb") as f:
-                    f.write(music_file.read())
-            elif DEFAULT_MUSIC_PATH and os.path.exists(DEFAULT_MUSIC_PATH):
-                chosen_music_path = DEFAULT_MUSIC_PATH
-
-            if not chosen_music_path:
-                st.error("Please upload a music file (or ensure DEFAULT_MUSIC_PATH exists).")
-                st.stop()
-
-            # Build segment list (order matters)
-            segments: List[Tuple[str, str]] = []
-            if get_text("intro", 0).strip():
-                segments.append(("intro", get_text("intro", 0).strip()))
-
-            for i in range(1, st.session_state.chapter_count + 1):
-                txt = get_text("chapter", i).strip()
-                if txt:
-                    title = st.session_state.outline[i - 1]["title"]
-                    segments.append((f"chapter_{i:02d}_{clean_filename(title)}", txt))
-
-            if get_text("outro", 0).strip():
-                segments.append(("outro", get_text("outro", 0).strip()))
-
-            if not segments:
-                st.error("No script text found to build audio.")
-                st.stop()
-
-            st.info("Generating TTS and mixing background music…")
-            progress = st.progress(0)
-            total = len(segments)
-
-            per_segment_mp3: Dict[str, bytes] = {}
-            mixed_wavs: List[str] = []
-
-            for idx, (slug, txt) in enumerate(segments, start=1):
-                voice_wav = os.path.join(td, f"{slug}_voice.wav")
-                mixed_wav = os.path.join(td, f"{slug}_mixed.wav")
-                out_mp3 = os.path.join(td, f"{slug}.mp3")
-
-                # TTS -> voice WAV
-                tts_to_wav(strip_tts_directives(sanitize_for_tts(txt)), tts_instructions, speed, voice_wav)
-
-                # Mix music under voice
-                mix_music_under_voice(voice_wav, chosen_music_path, mixed_wav, music_db=music_db, fade_s=fade_s)
-
-                # Encode MP3
-                wav_to_mp3(mixed_wav, out_mp3)
-
-                with open(out_mp3, "rb") as f:
-                    per_segment_mp3[slug] = f.read()
-
-                mixed_wavs.append(mixed_wav)
-                progress.progress(min(1.0, idx / total))
-
-            # Full episode MP3 (separate download; not inside the ZIP)
-            full_wav = os.path.join(td, "full_episode.wav")
-            full_mp3 = os.path.join(td, "full_episode.mp3")
-            concat_wavs(mixed_wavs, full_wav)
-            wav_to_mp3(full_wav, full_mp3)
-
-            with open(full_mp3, "rb") as f:
-                full_mp3_bytes = f.read()
-
-            # ZIP: scripts + segment MP3s (no full_episode.mp3)
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                # Metadata in NON-script extension so video creator won't pair it
-                z.writestr(
-                    "meta/episode_metadata.yaml",
-                    "topic: {topic}\ncentral_question: {cq}\n".format(
-                        topic=topic.replace("\n", " ").strip(),
-                        cq=st.session_state.get("central_question", "").replace("\n", " ").strip(),
-                    ),
-                )
-
-                # Narration scripts
-                z.writestr("scripts/intro.txt", get_text("intro", 0))
-                for i in range(1, st.session_state.chapter_count + 1):
-                    title = st.session_state.outline[i - 1]["title"]
-                    z.writestr(f"scripts/chapter_{i:02d}_{clean_filename(title)}.txt", get_text("chapter", i))
-                z.writestr("scripts/outro.txt", get_text("outro", 0))
-
-                # Audio (should match narration scripts)
-                for slug, b in per_segment_mp3.items():
-                    z.writestr(f"audio/{slug}.mp3", b)
-
-            zip_buf.seek(0)
-            st.session_state.built = {"zip": zip_buf.getvalue(), "full_mp3": full_mp3_bytes}
-            st.success("Done! Download below.")
-    except Exception as e:
-        st.error(f"Audio build failed: {e}")
-
-
-# ----------------------------
-# Downloads
-# ----------------------------
-st.header("4️⃣ Downloads")
-
-if st.session_state.built:
-    st.download_button(
-        "⬇️ Download ZIP (scripts + segment MP3s)",
-        data=st.session_state.built["zip"],
-        file_name=f"{clean_filename(topic)}_uappress_pack.zip",
-        mime="application/zip",
-    )
-    st.audio(st.session_state.built["full_mp3"], format="audio/mp3")
-    st.download_button(
-        "⬇️ Download Full Episode MP3",
-        data=st.session_state.built["full_mp3"],
-        file_name=f"{clean_filename(topic)}_full_episode.mp3",
-        mime="audio/mpeg",
-    )
-else:
-    st.caption("After you generate audio, your download buttons will appear here.")
 
