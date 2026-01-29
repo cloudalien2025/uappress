@@ -236,6 +236,23 @@ ensure_state()
 # ----------------------------
 _CHAPTER_RE = re.compile(r"(?i)^\s*chapter\s+(\d+)\s*(?:[:\-–—]\s*(.*))?\s*$")
 
+def detect_chapters_and_titles(master_text: str) -> Dict[int, str]:
+    """
+    Returns {chapter_number: chapter_title_or_empty}
+    Used ONLY to detect how many chapters exist.
+    """
+    chapters: Dict[int, str] = {}
+    if not master_text:
+        return chapters
+
+    for line in master_text.splitlines():
+        m = _CHAPTER_RE.match(line)
+        if m:
+            n = int(m.group(1))
+            title = (m.group(2) or "").strip()
+            chapters[n] = title
+
+    return chapters
 
 def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, object]:
     """
