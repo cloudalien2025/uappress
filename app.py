@@ -888,49 +888,181 @@ st.header("2️⃣ Scripts")
 # Ensure keys exist BEFORE widgets are created
 reset_script_text_fields(st.session_state.chapter_count)
 
-left, right = st.columns([1, 1])
+# ----------------------------
+# Master Script Paste (Option A)
+# ----------------------------
+def _normalize_heading_line(line: str) -> str:
+    return re.sub(r"\s+", " ", (line or "").strip()).upper()
 
-with left:
-    if st.button("Generate Intro", type="secondary", disabled=not st.session_state.outline):
-        with st.spinner("Writing intro…"):
-            intro_text = safe_chat(
-                prompt_intro(topic, global_style, episode_notes, central_question),
-                temperature=0.55,
-            )
-            intro_text = strip_meta_narration(intro_text)
-            st.session_state[text_key("intro", 0)] = intro_text
-            st.session_state.built = None
-        st.success("Intro generated.")
 
-with right:
-    if st.button("Generate Outro", type="secondary", disabled=not st.session_state.outline):
-        with st.spinner("Writing outro…"):
-            outro_text = safe_chat(
-                prompt_outro(topic, global_style, episode_notes, central_question),
-                temperature=0.55,
-            )
-            outro_text = strip_meta_narration(outro_text)
-            st.session_state[text_key("outro", 0)] = outro_text
-            st.session_state.built = None
-        st.success("Outro generated.")
+def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, object]:
+    """
+    Parse a single master script into intro / chapters / outro using strict headings.
 
-st.subheader("Intro")
-st.text_area(
-    "Intro text",
-    key=text_key("intro", 0),
-    height=220,
-    placeholder="Click Generate Intro to populate…",
-)
+    Supported headings (case-insensitive):
+      INTRO
+      CHAPTER 1: Title (title optional; colon optional)
+      CHAPTER 2
+      ...
+      OUTRO
+
+    IMPORTANT:
+      - Heading lines are NOT included in returned narration text.
+      - Chapter titles are ignored for narration (structure only).
+    """
+    txt = (master_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = txt.split("\n")
+
+    # Build indices of section starts
+    intro_idx = None
+    outro_idx = None
+    chapter_idx: Dict[int, int] = {}
+
+    # Match "CHAPTER 3", "CHAPTER 3:", "CHAPTER 3 -", "CHAPTER 3: Title"
+    chapter_re = re.compile(r"(?i)^\s*chapter\s+(\d+)\s*(?:[:\-–—].*)?$")
+
+    for i, raw in enumerate(lines):
+        h = _normalize_heading_line(raw)
+        if h == "INTRO":
+            intro_idx = i
+            continue
+        if h == "OUTRO":
+            outro_idx = i
+            continue
+        m = chapter_re.match(raw or "")
+        if m:
+            try:
+                n = int(m.group(1))
+                chapter_idx[n] = i
+            except Exception:
+                pass
+
+    # Helper to slice content between headings
+    def slice_block(start_i: int, end_i: int) -> str:
+        if start_i is None:
+            return ""
+        # exclude heading line itself
+        body = "\n".join(lines[start_i + 1 : end_i]).strip()
+        body = re.sub(r"\n{3,}", "\n\n", body).strip()
+        return body
+
+    # Determine ordered boundaries for each section
+    # Collect all heading positions to compute next boundary
+    positions: List[Tuple[str, int]] = []
+    if intro_idx is not None:
+        positions.append(("INTRO", intro_idx))
+    if outro_idx is not None:
+        positions.append(("OUTRO", outro_idx))
+    for n, idx in chapter_idx.items():
+        positions.append((f"CHAPTER {n}", idx))
+    positions.sort(key=lambda x: x[1])
+
+    # Map from position index to next heading line index
+    next_pos: Dict[int, int] = {}
+    for k in range(len(positions)):
+        cur_line = positions[k][1]
+        nxt_line = positions[k + 1][1] if k + 1 < len(positions) else len(lines)
+        next_pos[cur_line] = nxt_line
+
+    parsed: Dict[str, object] = {"intro": "", "outro": "", "chapters": {}}
+
+    # Intro
+    if intro_idx is not None:
+        parsed["intro"] = slice_block(intro_idx, next_pos.get(intro_idx, len(lines)))
+
+    # Outro
+    if outro_idx is not None:
+        parsed["outro"] = slice_block(outro_idx, next_pos.get(outro_idx, len(lines)))
+
+    # Chapters 1..N (strict template expectation)
+    chapters_out: Dict[int, str] = {}
+    for n in range(1, max(0, expected_chapters) + 1):
+        idx = chapter_idx.get(n)
+        if idx is None:
+            chapters_out[n] = ""
+            continue
+        chapters_out[n] = slice_block(idx, next_pos.get(idx, len(lines)))
+    parsed["chapters"] = chapters_out
+    return parsed
+
+
+st.subheader("📌 Paste Full Script (Intro + Chapter 1–N + Outro)")
+
+# Keep the key stable across reruns
+st.session_state.setdefault("MASTER_SCRIPT_TEXT", "")
+
+master_cols = st.columns([3, 1])
+with master_cols[0]:
+    st.text_area(
+        "Master script",
+        key="MASTER_SCRIPT_TEXT",
+        height=200,
+        placeholder=(
+            "Paste your full script here using headings:\n\n"
+            "INTRO\n...\n\n"
+            "CHAPTER 1: Title\n...\n\n"
+            "CHAPTER 2\n...\n\n"
+            "OUTRO\n..."
+        ),
+        help=(
+            "Headings are structural only and will NOT be inserted into narration boxes or spoken in MP3.\n"
+            "Supported headings: INTRO, CHAPTER 1..N, OUTRO (case-insensitive)."
+        ),
+    )
+
+with master_cols[1]:
+    fill_btn = st.button("Fill Boxes from Paste", type="primary", disabled=not st.session_state.outline)
+    clear_paste_btn = st.button("Clear Paste", type="secondary")
+
+if clear_paste_btn:
+    st.session_state["MASTER_SCRIPT_TEXT"] = ""
+    st.session_state.built = None
+    st.rerun()
+
+if fill_btn:
+    raw_master = st.session_state.get("MASTER_SCRIPT_TEXT", "")
+    if not raw_master.strip():
+        st.error("Paste a master script first.")
+    else:
+        parsed = parse_master_script(raw_master, st.session_state.chapter_count)
+
+        # Fill Intro/Outro/Chapters (HEADINGS ARE STRIPPED)
+        st.session_state[text_key("intro", 0)] = (parsed.get("intro") or "").strip()
+        chapters_map: Dict[int, str] = parsed.get("chapters", {}) or {}
+        for i in range(1, st.session_state.chapter_count + 1):
+            st.session_state[text_key("chapter", i)] = (chapters_map.get(i) or "").strip()
+        st.session_state[text_key("outro", 0)] = (parsed.get("outro") or "").strip()
+
+        st.session_state.built = None
+
+        # Soft validation feedback (strict template expected, but we still warn)
+        missing = []
+        if not st.session_state[text_key("intro", 0)].strip():
+            missing.append("INTRO")
+        for i in range(1, st.session_state.chapter_count + 1):
+            if not st.session_state[text_key("chapter", i)].strip():
+                missing.append(f"CHAPTER {i}")
+        if not st.session_state[text_key("outro", 0)].strip():
+            missing.append("OUTRO")
+
+        if missing:
+            st.warning("Parsed, but these sections were empty or missing: " + ", ".join(missing))
+        else:
+            st.success("All boxes filled from your master script (headings stripped).")
 
 st.divider()
 
+# ----------------------------
+# Clear Chapters
+# ----------------------------
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
-    gen_all = st.button("Generate All Chapters", disabled=not st.session_state.outline)
+    # Keep this button slot but remove generation behavior
+    st.caption("Paste → Fill Boxes above.")
 with c2:
     clear_all = st.button("Clear Chapters")
 with c3:
-    st.caption("Continuity is enforced automatically. No book-style roadmap narration.")
+    st.caption("Headings are structure-only and will NOT be spoken in MP3.")
 
 if clear_all:
     st.session_state["_clear_chapters_requested"] = True
@@ -938,10 +1070,12 @@ if clear_all:
     st.rerun()
 
 if st.session_state.get("_clear_chapters_requested"):
+    st.session_state[text_key("intro", 0)] = ""
     for i in range(1, st.session_state.chapter_count + 1):
         st.session_state[text_key("chapter", i)] = ""
+    st.session_state[text_key("outro", 0)] = ""
     st.session_state["_clear_chapters_requested"] = False
-    st.success("Chapters cleared.")
+    st.success("Intro, chapters, and outro cleared.")
 
 
 def has_any_script() -> bool:
@@ -956,46 +1090,20 @@ def has_any_script() -> bool:
 
 
 # ----------------------------
-# Generate all chapters (with continuity + anti-repetition)
+# Intro text box (manual editing allowed)
 # ----------------------------
-if gen_all and st.session_state.outline:
-    with st.spinner("Writing all chapters…"):
-        # Start introduced list from Intro (if any) so naming rules can kick in immediately
-        introduced = extract_keyphrases(get_text("intro", 0))
+st.subheader("Intro")
+st.text_area(
+    "Intro text",
+    key=text_key("intro", 0),
+    height=220,
+    placeholder="Paste via Master Script above, then click “Fill Boxes from Paste”…",
+)
 
-        for i, ch in enumerate(st.session_state.outline, 1):
-            prev_tail = last_paragraph(get_text("intro", 0)) if i == 1 else last_paragraph(get_text("chapter", i - 1))
-
-            txt = safe_chat(
-                prompt_chapter(
-                    topic=topic,
-                    chapter_title=ch["title"],
-                    target_minutes=ch["target_minutes"],
-                    beats=ch["beats"],
-                    global_style=global_style,
-                    episode_notes=episode_notes,
-                    central_question=central_question,
-                    prev_chapter_tail=prev_tail,
-                    introduced_phrases=introduced,
-                    chapter_index=i,
-                ),
-                temperature=0.45,
-            )
-            txt = strip_meta_narration(txt)
-            st.session_state[text_key("chapter", i)] = txt
-
-            # Update introduced entities from everything generated so far
-            cumulative = get_text("intro", 0) + "\n\n" + "\n\n".join(
-                get_text("chapter", k) for k in range(1, i + 1)
-            )
-            introduced = extract_keyphrases(cumulative[:20000])
-
-        st.session_state.built = None
-    st.success("All chapters generated (continuity enforced).")
-
+st.divider()
 
 # ----------------------------
-# Per-chapter generation (still continuity-safe)
+# Chapter boxes (NO generation; paste fills; manual edits allowed)
 # ----------------------------
 if st.session_state.outline:
     for i, ch in enumerate(st.session_state.outline, 1):
@@ -1004,54 +1112,28 @@ if st.session_state.outline:
 
             with cc1:
                 st.caption(f"Target: ~{ch['target_minutes']} min")
-                if st.button(f"Generate Chapter {i}", key=f"btn_gen_ch_{i}"):
-                    with st.spinner(f"Writing Chapter {i}…"):
-                        prev_tail = last_paragraph(get_text("intro", 0)) if i == 1 else last_paragraph(get_text("chapter", i - 1))
-
-                        # Introduced list = everything before this chapter (Intro + prior chapters)
-                        cumulative = get_text("intro", 0) + "\n\n" + "\n\n".join(
-                            get_text("chapter", k) for k in range(1, i)
-                        )
-                        introduced = extract_keyphrases(cumulative[:20000])
-
-                        txt = safe_chat(
-                            prompt_chapter(
-                                topic=topic,
-                                chapter_title=ch["title"],
-                                target_minutes=ch["target_minutes"],
-                                beats=ch["beats"],
-                                global_style=global_style,
-                                episode_notes=episode_notes,
-                                central_question=central_question,
-                                prev_chapter_tail=prev_tail,
-                                introduced_phrases=introduced,
-                                chapter_index=i,
-                            ),
-                            temperature=0.45,
-                        )
-                        txt = strip_meta_narration(txt)
-                        st.session_state[text_key("chapter", i)] = txt
-                        st.session_state.built = None
-                    st.success(f"Chapter {i} generated.")
+                st.caption("Narration only (no 'CHAPTER X' headings).")
 
             with cc2:
                 st.text_area(
                     f"Chapter {i} text",
                     key=text_key("chapter", i),
                     height=320,
-                    placeholder="Click Generate Chapter to populate…",
+                    placeholder="Filled from Master Script paste above (headings stripped). You can edit here.",
                 )
 
 st.divider()
 
+# ----------------------------
+# Outro text box (manual editing allowed)
+# ----------------------------
 st.subheader("Outro")
 st.text_area(
     "Outro text",
     key=text_key("outro", 0),
     height=220,
-    placeholder="Click Generate Outro to populate…",
+    placeholder="Paste via Master Script above, then click “Fill Boxes from Paste”…",
 )
-
 
 # ----------------------------
 # Audio build
@@ -1199,3 +1281,4 @@ if st.session_state.built:
     )
 else:
     st.caption("After you generate audio, your download buttons will appear here.")
+
