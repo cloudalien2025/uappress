@@ -1,19 +1,17 @@
 # ============================
-# PART 1/4 — Core Setup, Sidebar, State, Script Parsing (NO generation)
+# PART 1/5 — Core Setup, Sidebar, Clients, FFmpeg, Text + Script Parsing Utilities
 # ============================
-# app.py — UAPpress Documentary TTS Studio (Script → Audio)
+# app.py — UAPpress Documentary TTS Studio (Script → Audio) + OPTIONAL Master Prompt → Script
 #
 # REQUIREMENTS (requirements.txt):
 # streamlit>=1.30
 # openai>=1.0.0
 # imageio-ffmpeg>=0.4.9
 #
-# Design:
-# - NOT a script generator
-# - Script-to-audio production tool
-# - Paste master script → auto-split into Intro/Chapters/Outro boxes
-# - Generate audio per-section and full episode
-# - Streamlit Cloud safe (no secrets required)
+# DESIGN:
+# - Primary mode: Script-to-audio production tool
+# - Optional mode: Master Prompt → generates STRICT template script → auto-fills boxes
+# - Streamlit Cloud safe: API key entered manually each run (session-only)
 
 from __future__ import annotations
 
@@ -26,7 +24,6 @@ import zipfile
 import hashlib
 import tempfile
 import subprocess
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -39,7 +36,7 @@ import imageio_ffmpeg
 # ----------------------------
 st.set_page_config(page_title="UAPpress Documentary TTS Studio", layout="wide")
 st.title("🛸 UAPpress — Documentary TTS Studio")
-st.caption("Script → audio production. No hype. No outlines. No script generation.")
+st.caption("Script → audio production. (Optional) Master Prompt → Script → Audio.")
 
 
 # ----------------------------
@@ -60,7 +57,7 @@ def run_ffmpeg(cmd: List[str]) -> None:
 
 
 # ----------------------------
-# Sidebar — OpenAI API Key (session-only)
+# Sidebar — OpenAI API Key (session-only) + Settings
 # ----------------------------
 with st.sidebar:
     st.header("🔐 Keys (not saved)")
@@ -76,21 +73,32 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("⚙️ TTS Settings")
+    st.header("⚙️ Models")
     st.session_state.setdefault("TTS_MODEL", "gpt-4o-mini-tts")
     st.session_state.setdefault("TTS_VOICE", "onyx")
-
-    tts_model = st.text_input("TTS model", key="TTS_MODEL")
-    tts_voice = st.text_input("TTS voice", key="TTS_VOICE")
+    st.text_input("TTS model", key="TTS_MODEL")
+    st.text_input("TTS voice", key="TTS_VOICE")
 
     st.session_state.setdefault("TTS_SPEED", 1.0)
-    tts_speed = st.slider("Speed (reserved)", 0.75, 1.25, float(st.session_state["TTS_SPEED"]), 0.05)
-    st.session_state["TTS_SPEED"] = float(tts_speed)
+    st.slider("Speed (reserved)", 0.75, 1.25, float(st.session_state["TTS_SPEED"]), 0.05, key="TTS_SPEED")
+
+    st.divider()
+    st.header("🧾 Script Generation (optional)")
+    st.caption("Enable only if you want: Master Prompt → STRICT script → auto-fill boxes.")
+
+    st.session_state.setdefault("ENABLE_SCRIPT_GEN", False)
+    st.checkbox("Enable script generation", key="ENABLE_SCRIPT_GEN")
+
+    st.session_state.setdefault("SCRIPT_MODEL", "gpt-4o-mini")
+    st.text_input("Script model", key="SCRIPT_MODEL")
+
+    st.session_state.setdefault("DEFAULT_CHAPTERS", 8)
+    st.slider("Default chapters", 3, 20, int(st.session_state["DEFAULT_CHAPTERS"]), 1, key="DEFAULT_CHAPTERS")
 
     st.divider()
     st.header("🎧 Music Bed (optional)")
     st.session_state.setdefault("DEFAULT_MUSIC_PATH", "/mnt/data/dark-ambient-soundscape-music-409350.mp3")
-    default_music_path = st.text_input(
+    st.text_input(
         "Default music path",
         key="DEFAULT_MUSIC_PATH",
         help="Used if you don't upload a music file.",
@@ -98,17 +106,15 @@ with st.sidebar:
 
     st.session_state.setdefault("MUSIC_DB", -24)
     st.session_state.setdefault("MUSIC_FADE_S", 6)
-    music_db = st.slider("Music level (dB)", -36, -10, int(st.session_state["MUSIC_DB"]), 1)
-    fade_s = st.slider("Music fade (sec)", 2, 12, int(st.session_state["MUSIC_FADE_S"]), 1)
-    st.session_state["MUSIC_DB"] = int(music_db)
-    st.session_state["MUSIC_FADE_S"] = int(fade_s)
+    st.slider("Music level (dB)", -36, -10, int(st.session_state["MUSIC_DB"]), 1, key="MUSIC_DB")
+    st.slider("Music fade (sec)", 2, 12, int(st.session_state["MUSIC_FADE_S"]), 1, key="MUSIC_FADE_S")
 
     st.divider()
     st.header("🧠 Cache (recommended)")
     st.session_state.setdefault("ENABLE_TTS_CACHE", True)
     st.session_state.setdefault("CACHE_DIR", ".uappress_tts_cache")
-    enable_cache = st.checkbox("Enable TTS cache", key="ENABLE_TTS_CACHE")
-    cache_dir = st.text_input("Cache directory", key="CACHE_DIR")
+    st.checkbox("Enable TTS cache", key="ENABLE_TTS_CACHE")
+    st.text_input("Cache directory", key="CACHE_DIR")
     st.caption("Cache stores WAV chunks by hash so reruns are much faster.")
 
 
@@ -173,7 +179,7 @@ def sanitize_for_tts(text: str) -> str:
 
 
 def strip_tts_directives(text: str) -> str:
-    """Remove accidental voice/style directives from pasted scripts."""
+    """Remove accidental voice/style directives from pasted/generated scripts."""
     if not text:
         return ""
     t = text
@@ -204,11 +210,19 @@ def reset_script_text_fields(chapter_count: int) -> None:
 
 
 def ensure_state() -> None:
-    st.session_state.setdefault("chapter_count", 0)
     st.session_state.setdefault("episode_title", "Untitled Episode")
+
+    # Master inputs
+    st.session_state.setdefault("MASTER_PROMPT", "")
     st.session_state.setdefault("MASTER_SCRIPT_TEXT", "")
-    st.session_state.setdefault("last_build", None)  # build metadata
+
+    # Script boxes
+    st.session_state.setdefault("chapter_count", 0)
     reset_script_text_fields(int(st.session_state["chapter_count"]))
+
+    # Build metadata
+    st.session_state.setdefault("built_sections", {})
+    st.session_state.setdefault("last_build", None)
 
 
 ensure_state()
@@ -225,6 +239,15 @@ _CHAPTER_RE = re.compile(r"(?i)^\s*chapter\s+(\d+)\s*(?:[:\-–—]\s*(.*))?\s*$
 
 
 def detect_chapters_and_titles(master_text: str) -> Dict[int, str]:
+    """
+    Detect CHAPTER N headings and optional titles from the heading line.
+    Examples:
+      CHAPTER 1
+      CHAPTER 1: The Calm Before
+      CHAPTER 1 - The Calm Before
+      Chapter 1 — The Calm Before
+    Returns: {1: "The Calm Before", 2: "", ...}
+    """
     txt = (master_text or "").replace("\r\n", "\n").replace("\r", "\n")
     titles: Dict[int, str] = {}
     for line in txt.split("\n"):
@@ -241,16 +264,17 @@ def detect_chapters_and_titles(master_text: str) -> Dict[int, str]:
 
 def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, object]:
     """
+    Parse a single master script into intro / chapters / outro using strict headings.
+
     Headings (case-insensitive):
       INTRO
       CHAPTER 1[: Title]
       ...
       OUTRO
 
-    Returns:
-      { "intro": str, "outro": str, "chapters": {1: str, 2: str, ...} }
-
-    Heading lines are excluded from narration.
+    CRITICAL:
+      - Heading lines are NOT included in returned narration text.
+      - Only the body under each heading is returned.
     """
     txt = (master_text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = txt.split("\n")
@@ -293,7 +317,7 @@ def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, o
         if start_i is None:
             return ""
         end_i = next_pos.get(start_i, len(lines))
-        body = "\n".join(lines[start_i + 1 : end_i]).strip()
+        body = "\n".join(lines[start_i + 1 : end_i]).strip()  # excludes heading line
         body = re.sub(r"\n{3,}", "\n\n", body).strip()
         return body
 
@@ -307,112 +331,6 @@ def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, o
     parsed["chapters"] = chapters_out
     return parsed
 
-
-# ============================
-# UI — Script ingestion
-# ============================
-st.header("1️⃣ Script Ingestion")
-
-left, right = st.columns([2, 1])
-
-with left:
-    st.text_input("Episode title (used for filenames)", key="episode_title")
-
-with right:
-    st.caption("Paste a full script using the strict template:")
-    st.code(
-        "INTRO\n<intro...>\n\nCHAPTER 1: Optional Title\n<chapter 1...>\n\nCHAPTER 2\n<chapter 2...>\n\nOUTRO\n<outro...>",
-        language="text",
-    )
-
-st.subheader("📌 Paste Full Script (INTRO + CHAPTER 1–N + OUTRO)")
-st.text_area(
-    "Master script",
-    key="MASTER_SCRIPT_TEXT",
-    height=260,
-    placeholder=(
-        "INTRO\n"
-        "<intro narration...>\n\n"
-        "CHAPTER 1: Optional Title\n"
-        "<chapter 1 narration...>\n\n"
-        "CHAPTER 2\n"
-        "<chapter 2 narration...>\n\n"
-        "OUTRO\n"
-        "<outro narration...>\n"
-    ),
-    help="Headings are structure-only. They are stripped and will NOT be spoken.",
-)
-
-c1, c2, c3 = st.columns([1, 1, 2])
-with c1:
-    fill_btn = st.button("Fill Boxes from Paste", type="primary", disabled=not st.session_state["MASTER_SCRIPT_TEXT"].strip())
-with c2:
-    clear_paste_btn = st.button("Clear Paste")
-with c3:
-    st.caption("This app will not generate scripts. It only converts your pasted script to audio.")
-
-if clear_paste_btn:
-    st.session_state["MASTER_SCRIPT_TEXT"] = ""
-    st.session_state["chapter_count"] = 0
-    reset_script_text_fields(0)
-    st.session_state["last_build"] = None
-    st.rerun()
-
-if fill_btn:
-    raw_master = st.session_state.get("MASTER_SCRIPT_TEXT", "")
-    chapter_titles_map = detect_chapters_and_titles(raw_master)
-    detected_n = max(chapter_titles_map.keys()) if chapter_titles_map else 0
-
-    if detected_n <= 0:
-        st.error("No CHAPTER headings found. Use 'CHAPTER 1', 'CHAPTER 2', etc.")
-        st.stop()
-
-    st.session_state["chapter_count"] = int(detected_n)
-    reset_script_text_fields(int(detected_n))
-
-    parsed = parse_master_script(raw_master, int(detected_n))
-
-    st.session_state[text_key("intro", 0)] = (parsed.get("intro") or "").strip()
-    chapters_map: Dict[int, str] = parsed.get("chapters", {}) or {}
-    for i in range(1, int(detected_n) + 1):
-        st.session_state[text_key("chapter", i)] = (chapters_map.get(i) or "").strip()
-    st.session_state[text_key("outro", 0)] = (parsed.get("outro") or "").strip()
-
-    st.session_state["last_build"] = None
-
-    missing = []
-    if not st.session_state[text_key("intro", 0)].strip():
-        missing.append("INTRO")
-    for i in range(1, int(detected_n) + 1):
-        if not st.session_state[text_key("chapter", i)].strip():
-            missing.append(f"CHAPTER {i}")
-    if not st.session_state[text_key("outro", 0)].strip():
-        missing.append("OUTRO")
-
-    if missing:
-        st.warning("Filled what I could, but these sections were empty/missing: " + ", ".join(missing))
-    else:
-        st.success(f"Boxes filled: Intro + {detected_n} chapters + Outro (headings stripped).")
-
-st.divider()
-
-st.header("2️⃣ Script Boxes (edit-safe)")
-
-st.subheader("Intro")
-st.text_area("Intro text", key=text_key("intro", 0), height=220)
-
-chapter_count = int(st.session_state.get("chapter_count", 0))
-if chapter_count > 0:
-    for i in range(1, chapter_count + 1):
-        with st.expander(f"Chapter {i}", expanded=(i == 1)):
-            st.text_area(f"Chapter {i} text", key=text_key("chapter", i), height=320)
-else:
-    st.caption("Paste your master script above and click “Fill Boxes from Paste” to create chapter boxes.")
-
-st.subheader("Outro")
-st.text_area("Outro text", key=text_key("outro", 0), height=220)
-
-st.divider()
 
 # ============================
 # PART 2/4 — TTS Engine, FFmpeg Audio Ops, Cache, File Packaging
