@@ -327,202 +327,423 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 # ============================
-# PART 2/4 — Script Generation (Contract-Hardened) — FIXED
+# PART 2/4 — STRICT JSON GENERATION + CONTRACT ENFORCEMENT (Fixes NameError + 'str'.get + invalid chapters)
+# Paste this WHOLE block into app.py as your Part 2/4 (replace your existing Part 2/4 top-to-bottom).
 # ============================
+
+from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
-# ----------------------------
-# Contract + Schema
-# ----------------------------
+# ------------------------------------------------------------
+# JSON helpers (robust against "text + json", code fences, etc.)
+# ------------------------------------------------------------
 
-EVIDENCE_LABELS = ["FACT", "REPORT", "STATEMENT", "ANALYSIS", "DISPUTED"]
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL | re.IGNORECASE)
 
-SCRIPT_JSON_SCHEMA: Dict[str, Any] = {
-    "name": "uappress_investigative_script_v1",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["title", "central_question", "key_players", "chapters"],
-        "properties": {
-            "title": {"type": "string"},
-            "central_question": {"type": "string"},
-            "key_players": {
-                "type": "array",
-                "minItems": 2,
-                "items": {
-                    "type": "object",
-                    "required": ["full_name", "last_name", "role", "why_relevant", "source_types"],
-                    "properties": {
-                        "full_name": {"type": "string"},
-                        "last_name": {"type": "string"},
-                        "role": {"type": "string"},
-                        "why_relevant": {"type": "string"},
-                        "source_types": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-            "chapters": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "required": ["chapter_number", "chapter_title", "segments"],
-                    "properties": {
-                        "chapter_number": {"type": "integer"},
-                        "chapter_title": {"type": "string"},
-                        "segments": {
-                            "type": "array",
-                            "minItems": 3,
-                            "items": {
-                                "type": "object",
-                                "required": ["evidence_label", "text"],
-                                "properties": {
-                                    "evidence_label": {"type": "string", "enum": EVIDENCE_LABELS},
-                                    "text": {"type": "string"},
-                                },
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    },
-}
 
-CONTRACT_SYSTEM = """
-You are UAPpress Documentary TTS Studio — Script Generator.
+def _extract_json_candidate(text: str) -> str:
+    """
+    Try to pull a JSON object/array from:
+    - fenced ```json ... ```
+    - first { ... } block
+    - first [ ... ] block
+    Falls back to original text.
+    """
+    if not isinstance(text, str):
+        return ""
 
-NON-NEGOTIABLE RULES:
-- NO fictional prose
-- NO invented dialogue
-- NO mind-reading
-- Procedural, investigative tone only
-- Output MUST be valid JSON matching the provided schema
-- Chapters MUST be numbered sequentially starting at 1
-"""
+    m = _JSON_FENCE_RE.search(text)
+    if m:
+        return m.group(1).strip()
 
-# ----------------------------
-# Helpers
-# ----------------------------
+    # Try first object
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1].strip()
 
-def _build_user_brief() -> str:
-    return json.dumps({
-        "topic": st.session_state.get("episode_title", "Untitled Episode"),
-        "chapter_count": int(st.session_state.get("DEFAULT_CHAPTERS", 8)),
-        "tone": "investigative, procedural, restrained",
-    }, indent=2)
+    # Try first array
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1].strip()
 
-# ----------------------------
-# OpenAI Structured Call (FIXED)
-# ----------------------------
+    return text.strip()
 
-def _call_openai_json(schema: Dict[str, Any], user_brief_json: str, model: str) -> Dict[str, Any]:
+
+def _safe_json_loads(text: str) -> Tuple[bool, Any, str]:
+    """
+    Returns (ok, parsed, error_message)
+    """
     try:
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": CONTRACT_SYSTEM},
-                {"role": "user", "content": f"Generate the documentary script JSON.\n\nBRIEF:\n{user_brief_json}"},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": schema,
-            },
-        )
-
-        # ✅ CORRECT: responses API parsed output
-        if hasattr(resp, "output_parsed") and isinstance(resp.output_parsed, dict):
-            return resp.output_parsed
-
-        raise RuntimeError("Structured output missing (output_parsed not found).")
-
+        candidate = _extract_json_candidate(text)
+        parsed = json.loads(candidate)
+        return True, parsed, ""
     except Exception as e:
-        raise RuntimeError(f"Structured JSON generation failed: {e}")
+        return False, None, f"{type(e).__name__}: {e}"
 
-# ----------------------------
-# Validators
-# ----------------------------
 
-def _validate_script_json(script_json: Dict[str, Any], expected_chapters: int) -> Tuple[bool, List[str]]:
+# ------------------------------------------------------------
+# Contract enforcement (outline + script)
+# ------------------------------------------------------------
+
+def _outline_to_expected_chapter_count(outline_obj: Any, fallback: int = 10) -> int:
+    """
+    Outline can be:
+    - dict with keys like chapters / chapter_count / outline_chapters
+    - list of chapters
+    - or a string (bad). In that case fallback.
+    """
+    if isinstance(outline_obj, dict):
+        if isinstance(outline_obj.get("chapter_count"), int):
+            return int(outline_obj["chapter_count"])
+        ch = outline_obj.get("chapters")
+        if isinstance(ch, list) and len(ch) > 0:
+            return len(ch)
+        ch2 = outline_obj.get("outline_chapters")
+        if isinstance(ch2, list) and len(ch2) > 0:
+            return len(ch2)
+        return fallback
+
+    if isinstance(outline_obj, list):
+        return len(outline_obj) if outline_obj else fallback
+
+    # if it's a string or anything else
+    return fallback
+
+
+def _normalize_outline(outline_obj: Any) -> Dict[str, Any]:
+    """
+    Guarantee a dict with:
+      - chapter_count (int)
+      - chapters (list of {number, title, bullets})
+    """
+    if isinstance(outline_obj, dict):
+        # Ensure chapters list
+        chapters = outline_obj.get("chapters")
+        if not isinstance(chapters, list):
+            chapters = outline_obj.get("outline_chapters")
+        if not isinstance(chapters, list):
+            chapters = []
+
+        # Normalize chapter entries
+        norm_chapters: List[Dict[str, Any]] = []
+        for i, c in enumerate(chapters, start=1):
+            if isinstance(c, dict):
+                num = c.get("number", i)
+                title = c.get("title") or c.get("chapter_title") or f"Chapter {i}"
+                bullets = c.get("bullets") or c.get("beats") or c.get("points") or []
+                if isinstance(bullets, str):
+                    bullets = [b.strip() for b in bullets.splitlines() if b.strip()]
+                if not isinstance(bullets, list):
+                    bullets = []
+                norm_chapters.append({"number": int(num), "title": str(title), "bullets": bullets})
+            else:
+                # If chapter is a string
+                norm_chapters.append({"number": i, "title": str(c), "bullets": []})
+
+        chapter_count = outline_obj.get("chapter_count")
+        if not isinstance(chapter_count, int):
+            chapter_count = len(norm_chapters) if norm_chapters else 10
+
+        return {
+            "topic": outline_obj.get("topic"),
+            "chapter_count": int(chapter_count),
+            "chapters": norm_chapters,
+        }
+
+    if isinstance(outline_obj, list):
+        chapters = []
+        for i, c in enumerate(outline_obj, start=1):
+            if isinstance(c, dict):
+                title = c.get("title") or f"Chapter {i}"
+                bullets = c.get("bullets") or []
+                if isinstance(bullets, str):
+                    bullets = [b.strip() for b in bullets.splitlines() if b.strip()]
+                if not isinstance(bullets, list):
+                    bullets = []
+                chapters.append({"number": i, "title": str(title), "bullets": bullets})
+            else:
+                chapters.append({"number": i, "title": str(c), "bullets": []})
+        return {"chapter_count": len(chapters) if chapters else 10, "chapters": chapters}
+
+    # Anything else (string/bad)
+    return {"chapter_count": 10, "chapters": []}
+
+
+def _validate_script_contract(script_obj: Any, expected_chapters: int) -> Tuple[bool, List[str]]:
+    """
+    Script must be a dict with:
+      intro: str
+      chapters: list length expected_chapters
+      outro: str
+    Each chapter must be dict with:
+      number: int (1..N contiguous)
+      title: str
+      narration: str
+    """
     problems: List[str] = []
 
-    if not isinstance(script_json, dict):
-        return False, ["output_not_dict"]
+    if not isinstance(script_obj, dict):
+        problems.append("script_not_a_json_object")
+        return False, problems
 
-    chapters = script_json.get("chapters", [])
-    if not chapters:
-        problems.append(f"chapter_count_mismatch_expected_{expected_chapters}_got_0")
+    intro = script_obj.get("intro")
+    outro = script_obj.get("outro")
+    chapters = script_obj.get("chapters")
+
+    if not isinstance(intro, str) or not intro.strip():
+        problems.append("intro_missing_or_empty")
+    if not isinstance(outro, str) or not outro.strip():
+        problems.append("outro_missing_or_empty")
+
+    if not isinstance(chapters, list):
+        problems.append("chapters_missing_or_not_list")
         return False, problems
 
     if len(chapters) != expected_chapters:
         problems.append(f"chapter_count_mismatch_expected_{expected_chapters}_got_{len(chapters)}")
 
-    nums = [c.get("chapter_number") for c in chapters]
-    if nums != list(range(1, expected_chapters + 1)):
-        problems.append("chapter_numbers_not_contiguous_from_1")
+    # Validate contiguous numbering from 1..N
+    nums: List[int] = []
+    for i, ch in enumerate(chapters, start=1):
+        if not isinstance(ch, dict):
+            problems.append(f"chapter_{i}_not_object")
+            continue
+        n = ch.get("number", i)
+        try:
+            n_int = int(n)
+        except Exception:
+            n_int = -1
+        nums.append(n_int)
 
-    return len(problems) == 0, problems
+        title = ch.get("title")
+        narration = ch.get("narration")
 
-# ----------------------------
-# Render (only after validation)
-# ----------------------------
+        if not isinstance(title, str) or not title.strip():
+            problems.append(f"chapter_{i}_title_missing")
+        if not isinstance(narration, str) or not narration.strip():
+            problems.append(f"chapter_{i}_narration_missing")
 
-def _render_script_text(script_json: Dict[str, Any]) -> str:
-    out = []
-    out.append(script_json["title"])
-    out.append("")
-    out.append("KEY PLAYERS")
-    for kp in script_json["key_players"]:
-        out.append(f"- {kp['full_name']} — {kp['role']}")
-    out.append("")
+    if nums:
+        expected_nums = list(range(1, len(nums) + 1))
+        if nums != expected_nums:
+            problems.append("chapter_numbers_not_contiguous_from_1")
 
-    for ch in script_json["chapters"]:
-        out.append(f"CHAPTER {ch['chapter_number']}: {ch['chapter_title']}")
-        for seg in ch["segments"]:
-            out.append(f"[{seg['evidence_label']}] {seg['text']}")
-        out.append("")
+    ok = len(problems) == 0
+    return ok, problems
 
-    return "\n".join(out).strip()
 
-# ----------------------------
-# UI
-# ----------------------------
+# ------------------------------------------------------------
+# OpenAI call helpers
+# ------------------------------------------------------------
 
-st.subheader("Part 2/4 — Generate STRICT Script")
-
-model_name = st.session_state.get("SCRIPT_MODEL", "gpt-4.1-mini")
-expected_chapters = int(st.session_state.get("DEFAULT_CHAPTERS", 8))
-
-if st.button("Generate STRICT Script", type="primary"):
-    try:
-        brief = _build_user_brief()
-        script_json = _call_openai_json(SCRIPT_JSON_SCHEMA, brief, model_name)
-
-        ok, problems = _validate_script_json(script_json, expected_chapters)
-        st.session_state["script_generation_log"] = [{"ok": ok, "problems": problems}]
-
-        if not ok:
-            raise RuntimeError(" | ".join(problems))
-
-        st.session_state["generated_script_json"] = script_json
-        st.session_state["generated_script_text"] = _render_script_text(script_json)
-
-        st.success("Script generated and validated.")
-
-    except Exception as e:
-        st.session_state["generated_script_json"] = None
-        st.session_state["generated_script_text"] = ""
-        st.error(str(e))
-
-if st.session_state.get("generated_script_text"):
-    st.text_area(
-        "Generated Script (Narration-Ready)",
-        value=st.session_state["generated_script_text"],
-        height=500,
+def _call_openai_text(client, model: str, system: str, user: str, temperature: float = 0.3) -> str:
+    """
+    Compatible with OpenAI Python SDK (responses API).
+    Returns plain text.
+    """
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=temperature,
     )
+
+    # SDK returns output_text convenience; fall back if missing.
+    out = getattr(resp, "output_text", None)
+    if isinstance(out, str) and out.strip():
+        return out
+
+    # Fallback: try to stitch text from output blocks
+    try:
+        pieces = []
+        for item in resp.output or []:
+            for c in item.content or []:
+                if getattr(c, "type", "") in ("output_text", "text"):
+                    pieces.append(getattr(c, "text", "") or "")
+        return "\n".join(pieces).strip()
+    except Exception:
+        return ""
+
+
+# ------------------------------------------------------------
+# PUBLIC: generate_outline() + generate_script_strict()
+# (This fixes your NameError: generate_script_strict not defined)
+# ------------------------------------------------------------
+
+def generate_outline(
+    *,
+    client,
+    model: str,
+    topic: str,
+    chapter_count: int,
+    scope: str,
+    constraints: str,
+) -> Tuple[bool, Dict[str, Any], str]:
+    """
+    Returns (ok, outline_dict, message)
+    """
+    system = (
+        "You generate ONLY valid JSON. No markdown, no commentary.\n"
+        "Your job: produce a documentary outline.\n"
+    )
+
+    user = {
+        "task": "generate_outline",
+        "topic": topic,
+        "chapter_count": int(chapter_count),
+        "scope": scope,
+        "constraints": constraints,
+        "required_json_schema": {
+            "type": "object",
+            "required": ["chapter_count", "chapters"],
+            "properties": {
+                "topic": {"type": "string"},
+                "chapter_count": {"type": "integer"},
+                "chapters": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["number", "title", "bullets"],
+                        "properties": {
+                            "number": {"type": "integer"},
+                            "title": {"type": "string"},
+                            "bullets": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+        },
+        "hard_rules": [
+            f"chapters must be EXACTLY {int(chapter_count)} items",
+            "chapter numbers must be contiguous starting at 1",
+            "bullets must be short, non-repetitive, and forward-moving",
+        ],
+    }
+
+    raw = _call_openai_text(client, model, system, json.dumps(user), temperature=0.2)
+    ok, parsed, err = _safe_json_loads(raw)
+    if not ok:
+        return False, {"chapter_count": int(chapter_count), "chapters": []}, f"Outline JSON invalid: {err}"
+
+    outline = _normalize_outline(parsed)
+    expected = int(chapter_count)
+    got = int(outline.get("chapter_count") or 0)
+
+    # Force chapter_count to what user requested (avoid downstream mismatch)
+    outline["chapter_count"] = expected
+
+    # If model returned wrong count, we still accept but warn
+    if len(outline.get("chapters", [])) != expected:
+        return True, outline, f"Outline created but chapter list length != {expected}. (We will enforce at script stage.)"
+
+    return True, outline, "Outline created."
+
+
+def generate_script_strict(
+    *,
+    client,
+    model: str,
+    outline: Any,               # can be dict/list/string; we normalize inside
+    topic: str,
+    scope: str,
+    constraints: str,
+    target_runtime_min: int,
+) -> Tuple[bool, Dict[str, Any], str, List[Dict[str, Any]]]:
+    """
+    Returns (ok, script_dict, message, contract_log)
+    contract_log is a list of passes with problems (for your UI "Contract Enforcement Log")
+    """
+    contract_log: List[Dict[str, Any]] = []
+
+    outline_norm = _normalize_outline(outline)
+    expected_chapters = _outline_to_expected_chapter_count(outline_norm, fallback=10)
+
+    # If outline says 0 (bad), fall back to 10 so you don't get expected_10_got_0 chaos
+    if expected_chapters <= 0:
+        expected_chapters = 10
+        outline_norm["chapter_count"] = 10
+
+    system = (
+        "You generate ONLY valid JSON that matches the required schema exactly.\n"
+        "No markdown, no code fences, no commentary.\n"
+        "If you cannot comply, output an empty JSON object {}.\n"
+    )
+
+    def _prompt(pass_num: int, problems: List[str]) -> str:
+        payload = {
+            "task": "generate_strict_script",
+            "topic": topic,
+            "scope": scope,
+            "constraints": constraints,
+            "target_runtime_min": int(target_runtime_min),
+            "outline": outline_norm,
+            "required_json_schema": {
+                "type": "object",
+                "required": ["intro", "chapters", "outro"],
+                "properties": {
+                    "intro": {"type": "string"},
+                    "chapters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["number", "title", "narration"],
+                            "properties": {
+                                "number": {"type": "integer"},
+                                "title": {"type": "string"},
+                                "narration": {"type": "string"},
+                            },
+                        },
+                    },
+                    "outro": {"type": "string"},
+                },
+            },
+            "hard_rules": [
+                f"chapters MUST be EXACTLY {expected_chapters} items",
+                "chapter numbers MUST be contiguous starting at 1",
+                "NO repetition / NO recap phrasing",
+                "chapter narration must be long-form and forward-moving",
+            ],
+            "previous_pass_problems": problems,
+        }
+        return json.dumps(payload)
+
+    last_err = ""
+    last_parsed: Dict[str, Any] = {}
+
+    # 3-pass enforcement like your log expects
+    problems: List[str] = []
+    for p in (1, 2, 3):
+        raw = _call_openai_text(client, model, system, _prompt(p, problems), temperature=0.25)
+
+        ok_json, parsed, err = _safe_json_loads(raw)
+        if not ok_json:
+            problems = ["render_skipped_due_to_json_invalid", f"json_error_{err}"]
+            contract_log.append({"pass": p, "ok_json": False, "ok_render": False, "problems": problems[:]})
+            last_err = err
+            continue
+
+        # Validate contract
+        ok_render, problems = _validate_script_contract(parsed, expected_chapters)
+        contract_log.append({"pass": p, "ok_json": True, "ok_render": ok_render, "problems": problems[:]})
+
+        if ok_render:
+            return True, parsed, "Script created (strict JSON + contract enforced).", contract_log
+
+        last_parsed = parsed  # keep for debugging if needed
+
+    # Failed all passes
+    msg = "Script blocked by contract enforcement. Fix outline/title and retry."
+    if last_err:
+        msg += f" Last JSON error: {last_err}"
+    return False, (last_parsed if isinstance(last_parsed, dict) else {}), msg, contract_log
+
 
 # ============================
 # PART 3/4 — Outline UI → Generate Strict Script → Editable Review (Single Pipeline)
