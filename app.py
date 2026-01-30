@@ -331,8 +331,6 @@ client = OpenAI(api_key=api_key)
 # Paste this WHOLE block into app.py as your Part 2/4 (replace your existing Part 2/4 top-to-bottom).
 # ============================
 
-from __future__ import annotations
-
 import json
 import re
 from typing import Any, Dict, List, Tuple, Optional
