@@ -805,33 +805,37 @@ def has_any_script() -> bool:
     return False
 
 # ============================
-# PART 3/4 — Outline → Full Script Pipeline (UI + Parsing + Population) — PATCHED
+# PART 3/4 — Outline → Full Script Pipeline (UI + Parsing + Population) — FIXED (NO widget-owned state writes)
 # ============================
-# Goals of this patch:
-# ✅ No StreamlitAPIException: never assign to widget-owned keys after widget creation
-# ✅ Clear separation of: episode metadata, outline text, master script text, parsed sections
-# ✅ Safer generation buttons + validation
-# ✅ Robust chapter detection + parsing guardrails
-# ✅ One place to reset + one place to populate
-# ✅ Keeps already-generated audio untouched (text-only clears)
+# Fix:
+# ✅ OUTLINE_TEXT is now split into:
+#    - OUTLINE_TEXT_UI  (widget-owned, editable)
+#    - OUTLINE_TEXT_SRC (programmatic copy, safe to set anytime)
+# ✅ All generation/clears write to *_SRC and then mirror into *_UI ONLY via st.rerun() flow
+# ✅ We never assign to OUTLINE_TEXT_UI after its widget is instantiated in the same run.
 
 st.header("1️⃣ Script Creation")
 
-# ----------------------------
-# Session defaults (non-widget keys only)
-# ----------------------------
-st.session_state.setdefault("_OUTLINE_READY", False)
-st.session_state.setdefault("_LAST_OUTLINE_HASH", "")
-st.session_state.setdefault("_LAST_SCRIPT_HASH", "")
-st.session_state.setdefault("MASTER_SCRIPT_TEXT", "")
-st.session_state.setdefault("chapter_count", 0)
+import hashlib
 
 # ----------------------------
-# Episode metadata (WIDGET KEYS)
+# Session defaults
 # ----------------------------
 st.session_state.setdefault("episode_title", "Untitled Episode")
 st.session_state.setdefault("DEFAULT_CHAPTERS", 8)
 
+# Outline state split (CRITICAL FIX)
+st.session_state.setdefault("OUTLINE_TEXT_UI", "")    # widget-owned
+st.session_state.setdefault("OUTLINE_TEXT_SRC", "")   # programmatic source-of-truth
+st.session_state.setdefault("_OUTLINE_READY", False)
+
+# Script state
+st.session_state.setdefault("MASTER_SCRIPT_TEXT", "")
+st.session_state.setdefault("chapter_count", 0)
+
+# ----------------------------
+# Episode metadata
+# ----------------------------
 colA, colB = st.columns([3, 1])
 with colA:
     st.text_input("Episode Title", key="episode_title")
@@ -851,26 +855,70 @@ st.divider()
 # ----------------------------
 st.subheader("🧠 Outline / Treatment")
 
-st.session_state.setdefault("OUTLINE_TEXT", "")
+def _hash_text(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+
+def _safe_int(x, default=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+def _sync_outline_src_from_ui():
+    """
+    Pull latest edits from widget into SRC.
+    Safe because we write ONLY to OUTLINE_TEXT_SRC here.
+    """
+    st.session_state["OUTLINE_TEXT_SRC"] = (st.session_state.get("OUTLINE_TEXT_UI") or "").strip()
+
+def _apply_outline_to_ui_next_run(outline_text: str):
+    """
+    We cannot set OUTLINE_TEXT_UI after the widget is instantiated.
+    So we:
+      1) set SRC now
+      2) set a pending flag
+      3) rerun
+    On the next run (before widget instantiation), we preload OUTLINE_TEXT_UI from SRC.
+    """
+    st.session_state["OUTLINE_TEXT_SRC"] = (outline_text or "").strip()
+    st.session_state["_PENDING_OUTLINE_TO_UI"] = True
+    st.session_state["_OUTLINE_READY"] = True
+    st.session_state["_OUTLINE_HASH"] = _hash_text(st.session_state["OUTLINE_TEXT_SRC"])
+    st.rerun()
+
+def _clear_outline():
+    st.session_state["OUTLINE_TEXT_SRC"] = ""
+    st.session_state["_OUTLINE_READY"] = False
+    st.session_state["_OUTLINE_HASH"] = ""
+    st.session_state["_PENDING_OUTLINE_TO_UI"] = True
+    st.rerun()
+
+# Preload the widget value BEFORE the widget is created (safe)
+if st.session_state.get("_PENDING_OUTLINE_TO_UI", False):
+    st.session_state["_PENDING_OUTLINE_TO_UI"] = False
+    st.session_state["OUTLINE_TEXT_UI"] = st.session_state.get("OUTLINE_TEXT_SRC", "")
+
+# Button enable logic
+_title_ok = bool((st.session_state.get("episode_title") or "").strip())
+
+# Always keep SRC synced to UI edits (safe)
+_sync_outline_src_from_ui()
+_outline_ok = bool((st.session_state.get("OUTLINE_TEXT_SRC") or "").strip())
 
 outline_btn_col, script_btn_col = st.columns([1, 1])
 
-# Button enable logic (computed; no state mutation)
-_outline_ok = bool(st.session_state.get("episode_title", "").strip())
-_outline_text_ok = bool(st.session_state.get("OUTLINE_TEXT", "").strip())
-
 with outline_btn_col:
-    generate_outline_btn = st.button("Generate Outline", type="primary", disabled=not _outline_ok)
+    generate_outline_btn = st.button("Generate Outline", type="primary", disabled=not _title_ok)
 
 with script_btn_col:
-    generate_script_btn = st.button("Generate Full Script", disabled=not _outline_text_ok)
+    generate_script_btn = st.button("Generate Full Script", disabled=not _outline_ok)
 
 # ----------------------------
-# Outline text area (editable)
+# Outline text area (editable) — WIDGET KEY IS OUTLINE_TEXT_UI
 # ----------------------------
 st.text_area(
     "Outline (editable)",
-    key="OUTLINE_TEXT",
+    key="OUTLINE_TEXT_UI",
     height=300,
     help=(
         "This outline guides the full documentary.\n"
@@ -884,51 +932,6 @@ st.caption(
 )
 
 st.divider()
-
-def _hash_text(s: str) -> str:
-    import hashlib
-    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
-
-def _safe_int(x, default=0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return int(default)
-
-def _clear_script_text_only():
-    # Clears ONLY text fields (intro/chapters/outro + master script). Does NOT touch any audio artifacts.
-    st.session_state["MASTER_SCRIPT_TEXT"] = ""
-    n = _safe_int(st.session_state.get("chapter_count", 0), 0)
-    reset_script_text_fields(n)
-    st.session_state["chapter_count"] = 0
-
-def _populate_from_master_script(raw_script: str):
-    # Detect chapters
-    chapter_map = detect_chapters_and_titles(raw_script)
-    detected_n = max(chapter_map.keys()) if chapter_map else 0
-    if detected_n <= 0:
-        raise ValueError("No CHAPTER headings detected in generated script. Check the model output format.")
-
-    # Reset + parse + populate
-    st.session_state["chapter_count"] = detected_n
-    reset_script_text_fields(detected_n)
-
-    parsed = parse_master_script(raw_script, detected_n)
-
-    intro_txt = (parsed.get("intro") or "").strip()
-    outro_txt = (parsed.get("outro") or "").strip()
-    chapters_dict = parsed.get("chapters") or {}
-
-    if not intro_txt:
-        raise ValueError("Parser returned empty INTRO. The script may be missing an INTRO section.")
-    if not outro_txt:
-        raise ValueError("Parser returned empty OUTRO. The script may be missing an OUTRO section.")
-
-    st.session_state[text_key("intro", 0)] = intro_txt
-    for i in range(1, detected_n + 1):
-        st.session_state[text_key("chapter", i)] = (chapters_dict.get(i) or "").strip()
-    st.session_state[text_key("outro", 0)] = outro_txt
-
 
 # ----------------------------
 # Generate OUTLINE (one-shot)
@@ -951,33 +954,33 @@ CHAPTER COUNT:
 {chapters_n}
 
 TASK:
-Generate a documentary OUTLINE ONLY. This is NOT narration.
+Generate a documentary OUTLINE ONLY.
 
-FORMAT (STRICT):
+FORMAT:
 INTRO
 - Time, place, institutional context
 - Key players (full names + roles)
 - Stakes and triggering decision
 
-CHAPTER 1–{chapters_n}:
+CHAPTER 1–N:
 Each chapter must specify:
-- Central decision (single sentence)
+- Central decision
 - Key witness(es)
-- Primary document/evidence (report, memo, transcript, FOIA, testimony)
-- Institutional response (military, government, media, etc.)
-- Consequence / unresolved tension (what changes after this chapter)
+- Document or evidence
+- Institutional response
+- Consequence or unresolved tension
 
-OUTRO
+OUTRO:
 - Human consequences
 - Institutional outcome
-- Open questions (clearly labeled as questions)
+- Open questions
 
 RULES:
 - No narration prose
-- No summaries of later chapters inside earlier chapters
-- No speculation or invented quotes
-- No meta commentary about writing or structure
-- Clear chronological flow
+- No summaries
+- No speculation
+- No meta commentary
+- Clear chronology
 """.strip()
 
             response = client.chat.completions.create(
@@ -991,40 +994,30 @@ RULES:
             )
 
             outline_text = (response.choices[0].message.content or "").strip()
-
-            # Basic structural validation
             u = outline_text.upper()
             if "INTRO" not in u or "CHAPTER" not in u or "OUTRO" not in u:
-                raise ValueError("Outline generation failed: missing INTRO/CHAPTER/OUTRO sections.")
+                raise ValueError("Outline generation failed: missing required sections.")
 
-            st.session_state["OUTLINE_TEXT"] = outline_text
-            st.session_state["_OUTLINE_READY"] = True
-            st.session_state["_LAST_OUTLINE_HASH"] = _hash_text(outline_text)
-            st.success("Outline generated. Review and edit before generating full script.")
+            # IMPORTANT: Apply via rerun-safe flow (no direct OUTLINE_TEXT_UI assignment here)
+            _apply_outline_to_ui_next_run(outline_text)
 
         except Exception as e:
             st.error(str(e))
 
 # ----------------------------
-# Generate FULL SCRIPT (uses outline)
+# Generate FULL SCRIPT (uses outline SRC)
 # ----------------------------
 if generate_script_btn:
     title = (st.session_state.get("episode_title") or "").strip()
-    outline = (st.session_state.get("OUTLINE_TEXT") or "").strip()
+    outline = (st.session_state.get("OUTLINE_TEXT_SRC") or "").strip()
     chapters_n = _safe_int(st.session_state.get("DEFAULT_CHAPTERS", 8), 8)
 
-    if not title:
-        st.error("Episode title is required.")
-        st.stop()
     if not outline:
         st.error("Outline is required before generating the full script.")
         st.stop()
 
     with st.spinner("Generating full investigative documentary script…"):
         try:
-            # If user edited outline, refresh hash (this is safe; not a widget-owned key)
-            st.session_state["_LAST_OUTLINE_HASH"] = _hash_text(outline)
-
             raw_script = generate_master_script_one_shot(
                 topic=title,
                 outline=outline,
@@ -1036,15 +1029,30 @@ if generate_script_btn:
             if not raw_script:
                 raise ValueError("Script generation returned empty output.")
 
-            # Store raw script (non-widget key)
+            # Store raw script
             st.session_state["MASTER_SCRIPT_TEXT"] = raw_script
-            st.session_state["_LAST_SCRIPT_HASH"] = _hash_text(raw_script)
 
-            # Populate editor fields from the script
-            _populate_from_master_script(raw_script)
+            # Detect chapters
+            chapter_map = detect_chapters_and_titles(raw_script)
+            detected_n = max(chapter_map.keys()) if chapter_map else 0
+            if detected_n <= 0:
+                raise ValueError("No CHAPTER headings detected in generated script.")
 
-            n = _safe_int(st.session_state.get("chapter_count", 0), 0)
-            st.success(f"Full script generated: Intro + {n} chapters + Outro.")
+            # Reset fields safely
+            st.session_state["chapter_count"] = detected_n
+            reset_script_text_fields(detected_n)
+
+            # Parse + populate
+            parsed = parse_master_script(raw_script, detected_n)
+
+            st.session_state[text_key("intro", 0)] = (parsed.get("intro", "") or "").strip()
+            for i in range(1, detected_n + 1):
+                st.session_state[text_key("chapter", i)] = (
+                    (parsed.get("chapters", {}).get(i, "") or "")
+                ).strip()
+            st.session_state[text_key("outro", 0)] = (parsed.get("outro", "") or "").strip()
+
+            st.success(f"Full script generated: Intro + {detected_n} chapters + Outro.")
 
         except Exception as e:
             st.error(str(e))
@@ -1091,29 +1099,20 @@ st.text_area(
 # Reset controls
 # ----------------------------
 st.divider()
-c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+c1, c2, c3 = st.columns([1, 1, 2])
 
 with c1:
     if st.button("Clear Script"):
-        _clear_script_text_only()
-        st.success("Script cleared (text only).")
+        reset_script_text_fields(st.session_state.get("chapter_count", 0))
+        st.session_state["chapter_count"] = 0
+        st.session_state["MASTER_SCRIPT_TEXT"] = ""
+        st.success("Script cleared.")
 
 with c2:
     if st.button("Clear Outline"):
-        st.session_state["OUTLINE_TEXT"] = ""
-        st.session_state["_OUTLINE_READY"] = False
-        st.session_state["_LAST_OUTLINE_HASH"] = ""
-        st.success("Outline cleared.")
+        _clear_outline()
 
 with c3:
-    if st.button("Reload From Master Script", disabled=not bool(st.session_state.get("MASTER_SCRIPT_TEXT", "").strip())):
-        try:
-            _populate_from_master_script(st.session_state.get("MASTER_SCRIPT_TEXT", ""))
-            st.success("Re-parsed and reloaded editor fields from MASTER_SCRIPT_TEXT.")
-        except Exception as e:
-            st.error(str(e))
-
-with c4:
     st.caption("Clearing text does not affect any already-generated audio.")
 
 # ============================
