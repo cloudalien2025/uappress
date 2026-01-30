@@ -1,5 +1,5 @@
 # ============================
-# PART 1/4 — App Shell + Sidebar Settings
+# PART 1/4 — App Shell + Sidebar (Onyx HQ Voice-Only)
 # File: app.py
 # ============================
 from __future__ import annotations
@@ -10,7 +10,6 @@ import re
 import zipfile
 import tempfile
 import subprocess
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -18,36 +17,28 @@ import imageio_ffmpeg
 from openai import OpenAI
 
 
-APP_TITLE = "UAPpress — Manual Script → MP3 Studio"
-DEFAULT_MODEL = "gpt-4o-mini-tts"  # TTS model (keep configurable if you want)
-DEFAULT_VOICE = "onyx"            # your requested voice
+APP_TITLE = "UAPpress — Manual Script → HQ Onyx MP3 Studio"
+
+# Voice-only defaults (high quality)
+DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
+DEFAULT_VOICE = "onyx"
+DEFAULT_MP3_BITRATE = "320k"   # highest practical MP3 setting
+DEFAULT_SR = 48000             # 48kHz for clean masters
+
 
 # ----------------------------
-# Basic helpers
+# Helpers
 # ----------------------------
-def _ensure_state() -> None:
-    """
-    Initialize Streamlit session_state keys safely.
-    """
-    if "project_title" not in st.session_state:
-        st.session_state.project_title = "Untitled Documentary"
+def _ffmpeg_path() -> str:
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
-    # Each chapter is a dict: {"id": "<stable-id>", "text": ""}
-    if "chapters" not in st.session_state:
-        st.session_state.chapters = []
 
-    if "intro_text" not in st.session_state:
-        st.session_state.intro_text = ""
-
-    if "outro_text" not in st.session_state:
-        st.session_state.outro_text = ""
-
-    if "generated_files" not in st.session_state:
-        # maps filename -> bytes
-        st.session_state.generated_files = {}
-
-    if "last_build_log" not in st.session_state:
-        st.session_state.last_build_log = ""
+def _run(cmd: List[str]) -> Tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return p.returncode, p.stdout or ""
+    except Exception as e:
+        return 1, f"Subprocess error: {e}"
 
 
 def _slugify(s: str) -> str:
@@ -57,137 +48,115 @@ def _slugify(s: str) -> str:
     return s or "project"
 
 
-def _stable_chapter_id() -> str:
-    """
-    Create a stable-ish ID without importing uuid (keep dependencies minimal).
-    Uses a short random token from os.urandom.
-    """
+def _ensure_state() -> None:
+    if "project_title" not in st.session_state:
+        st.session_state.project_title = "Untitled Documentary"
+    if "intro_text" not in st.session_state:
+        st.session_state.intro_text = ""
+    if "outro_text" not in st.session_state:
+        st.session_state.outro_text = ""
+    if "chapters" not in st.session_state:
+        # list of dicts: {"id": "<stable>", "text": ""}
+        st.session_state.chapters = []
+    if "built" not in st.session_state:
+        st.session_state.built = None
+    if "last_build_log" not in st.session_state:
+        st.session_state.last_build_log = ""
+
+
+def _stable_id() -> str:
     return os.urandom(6).hex()
 
 
-def _ffmpeg_path() -> str:
-    return imageio_ffmpeg.get_ffmpeg_exe()
+def _word_count(text: str) -> int:
+    text = (text or "").strip()
+    if not text:
+        return 0
+    return len(re.findall(r"\b\w+\b", text))
 
 
-@dataclass
-class AudioOptions:
-    api_key: str
-    model: str
-    voice: str
-    output_bitrate: str
-    add_music: bool
-    music_bytes: Optional[bytes]
-    music_volume: float          # 0.0–1.0 (applied as multiplier)
-    speech_gain_db: float        # e.g., 0, +2, -2
-    music_loop: bool             # loop music to match speech if needed
-    padding_ms: int              # silence at start/end
-
-
-def _sidebar_controls() -> AudioOptions:
-    st.sidebar.header("Settings")
-
-    api_key = st.sidebar.text_input(
-        "OpenAI API Key",
-        value=os.environ.get("OPENAI_API_KEY", ""),
-        type="password",
-        help="Required to generate Onyx TTS audio.",
-        key="openai_api_key_input",
-    )
-
-    st.sidebar.subheader("Voice")
-    model = st.sidebar.text_input("TTS model", value=DEFAULT_MODEL)
-    voice = st.sidebar.text_input("Voice", value=DEFAULT_VOICE)
-
-    st.sidebar.subheader("Audio Output")
-    output_bitrate = st.sidebar.selectbox(
-        "MP3 bitrate",
-        options=["128k", "160k", "192k", "256k", "320k"],
-        index=2,
-        help="Higher bitrate = larger files.",
-    )
-
-    st.sidebar.subheader("Music (Optional)")
-    add_music = st.sidebar.checkbox("Mix background music", value=False)
-    music_bytes = None
-    if add_music:
-        music_file = st.sidebar.file_uploader(
-            "Upload music file (mp3/wav)",
-            type=["mp3", "wav", "m4a"],
-            accept_multiple_files=False,
-        )
-        if music_file is not None:
-            music_bytes = music_file.read()
-
-        music_volume = st.sidebar.slider(
-            "Music volume",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.18,
-            step=0.01,
-            help="How loud the music is relative to narration.",
-        )
-        music_loop = st.sidebar.checkbox(
-            "Loop music to match narration length",
-            value=True,
-            help="If music is shorter than narration, loop it.",
-        )
-    else:
-        music_volume = 0.0
-        music_loop = True
-
-    st.sidebar.subheader("Fine Tuning")
-    speech_gain_db = st.sidebar.slider(
-        "Narration gain (dB)",
-        min_value=-6.0,
-        max_value=6.0,
-        value=0.0,
-        step=0.5,
-        help="Boost/cut narration volume before mixing.",
-    )
-    padding_ms = st.sidebar.selectbox(
-        "Add silence padding (ms)",
-        options=[0, 150, 250, 500, 750, 1000],
-        index=2,
-        help="Adds a little space before/after each section.",
-    )
-
-    return AudioOptions(
-        api_key=api_key.strip(),
-        model=model.strip() or DEFAULT_MODEL,
-        voice=voice.strip() or DEFAULT_VOICE,
-        output_bitrate=output_bitrate,
-        add_music=add_music,
-        music_bytes=music_bytes,
-        music_volume=music_volume,
-        speech_gain_db=float(speech_gain_db),
-        music_loop=music_loop,
-        padding_ms=int(padding_ms),
-    )
+def _est_minutes(words: int) -> float:
+    # ~150 wpm
+    if words <= 0:
+        return 0.0
+    return words / 150.0
 
 
 # ----------------------------
-# App page setup
+# Page
 # ----------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
 _ensure_state()
-opts = _sidebar_controls()
+
+# ----------------------------
+# Sidebar (HQ settings)
+# ----------------------------
+st.sidebar.header("Settings (HQ Voice-Only)")
+
+api_key = st.sidebar.text_input(
+    "OpenAI API Key",
+    value=os.environ.get("OPENAI_API_KEY", ""),
+    type="password",
+    help="Required to generate Onyx TTS audio.",
+)
+
+st.sidebar.subheader("Voice")
+tts_model = st.sidebar.text_input("TTS model", value=DEFAULT_TTS_MODEL)
+voice = st.sidebar.text_input("Voice", value=DEFAULT_VOICE)
+
+st.sidebar.subheader("Quality")
+mp3_bitrate = st.sidebar.selectbox(
+    "MP3 bitrate",
+    options=["192k", "256k", "320k"],
+    index=2,
+)
+sample_rate = st.sidebar.selectbox(
+    "Master sample rate",
+    options=[44100, 48000],
+    index=1,
+    help="48kHz recommended; keeps masters clean and consistent.",
+)
+
+st.sidebar.subheader("Loudness (broadcast-style)")
+target_lufs = st.sidebar.selectbox(
+    "Target loudness (LUFS-I)",
+    options=[-18, -16, -14],
+    index=1,
+    help="For YouTube/podcast-style delivery, -16 LUFS is a solid target.",
+)
+true_peak = st.sidebar.selectbox(
+    "True peak limit (dBTP)",
+    options=[-2.0, -1.5, -1.0],
+    index=2,
+)
+
+st.sidebar.subheader("Delivery Instructions")
+tts_instructions = st.sidebar.text_area(
+    "Instructions (used as guidance for TTS)",
+    value=(
+        "Calm, authoritative, restrained documentary narration. "
+        "Measured pace with subtle pauses. Crisp consonants. "
+        "No theatricality."
+    ),
+    height=120,
+)
 
 st.text_input("Project title", key="project_title")
 
 st.caption(
-    "Paste your Intro, Chapter 1..N, and Outro scripts below. "
-    "Click **Create Audio** to generate separate MP3s for each non-empty section."
+    "Paste your Intro, Chapters, and Outro. The app reads exactly what you paste. "
+    "Exports HQ voice-only MP3s and a full-episode MP3, normalized to your loudness target."
 )
 
 # ============================
-# PART 2/4 — Script Builder UI (Intro + Dynamic Chapters + Outro)
-# (append below Part 1 in app.py)
+# PART 2/4 — Manual Script Builder (Intro + Chapters 1..N + Outro)
+# Append below Part 1
 # ============================
 
 def _add_chapter() -> None:
-    st.session_state.chapters.append({"id": _stable_chapter_id(), "text": ""})
+    st.session_state.chapters.append({"id": _stable_id(), "text": ""})
 
 
 def _remove_chapter(idx: int) -> None:
@@ -196,30 +165,12 @@ def _remove_chapter(idx: int) -> None:
 
 
 def _move_chapter(idx: int, direction: int) -> None:
-    """
-    direction: -1 up, +1 down
-    """
     chapters = st.session_state.chapters
-    new_idx = idx + direction
-    if 0 <= idx < len(chapters) and 0 <= new_idx < len(chapters):
-        chapters[idx], chapters[new_idx] = chapters[new_idx], chapters[idx]
+    j = idx + direction
+    if 0 <= idx < len(chapters) and 0 <= j < len(chapters):
+        chapters[idx], chapters[j] = chapters[j], chapters[idx]
 
 
-def _section_word_count(text: str) -> int:
-    text = (text or "").strip()
-    if not text:
-        return 0
-    return len(re.findall(r"\b\w+\b", text))
-
-
-def _est_minutes(word_count: int) -> float:
-    # rough narration pace ~150 wpm
-    if word_count <= 0:
-        return 0.0
-    return word_count / 150.0
-
-
-# --- Layout
 left, right = st.columns([1.25, 0.75], gap="large")
 
 with left:
@@ -227,24 +178,25 @@ with left:
 
     st.markdown("### Intro")
     st.text_area(
-        "Intro text (read exactly as pasted)",
+        "Intro",
         key="intro_text",
         height=220,
         placeholder="Paste your Intro here…",
         label_visibility="collapsed",
     )
-    wc_intro = _section_word_count(st.session_state.intro_text)
+    wc_intro = _word_count(st.session_state.intro_text)
     st.caption(f"Intro: {wc_intro} words • ~{_est_minutes(wc_intro):.1f} min")
 
     st.markdown("---")
     st.markdown("### Chapters")
 
-    c1, c2 = st.columns([0.2, 0.8])
-    with c1:
+    a, b = st.columns([0.25, 0.75])
+    with a:
         if st.button("+ Add Chapter", use_container_width=True):
             _add_chapter()
-    with c2:
-        st.caption("Chapters are numbered automatically (Chapter 1, Chapter 2, …).")
+            st.rerun()
+    with b:
+        st.caption("Chapters are numbered automatically: Chapter 1, Chapter 2, …")
 
     if len(st.session_state.chapters) == 0:
         st.info("No chapters yet. Click **+ Add Chapter** to add Chapter 1.")
@@ -252,64 +204,57 @@ with left:
     for idx, ch in enumerate(st.session_state.chapters):
         chap_num = idx + 1
         with st.container(border=True):
-            header_cols = st.columns([0.55, 0.15, 0.15, 0.15])
-            header_cols[0].markdown(f"**Chapter {chap_num}**")
+            cols = st.columns([0.55, 0.15, 0.15, 0.15])
+            cols[0].markdown(f"**Chapter {chap_num}**")
 
             up_disabled = idx == 0
-            down_disabled = idx == len(st.session_state.chapters) - 1
+            dn_disabled = idx == len(st.session_state.chapters) - 1
 
-            if header_cols[1].button("↑", key=f"ch_up_{ch['id']}", disabled=up_disabled):
+            if cols[1].button("↑", key=f"ch_up_{ch['id']}", disabled=up_disabled):
                 _move_chapter(idx, -1)
                 st.rerun()
-            if header_cols[2].button("↓", key=f"ch_dn_{ch['id']}", disabled=down_disabled):
+            if cols[2].button("↓", key=f"ch_dn_{ch['id']}", disabled=dn_disabled):
                 _move_chapter(idx, +1)
                 st.rerun()
-            if header_cols[3].button("Remove", key=f"ch_rm_{ch['id']}"):
+            if cols[3].button("Remove", key=f"ch_rm_{ch['id']}"):
                 _remove_chapter(idx)
                 st.rerun()
 
             st.text_area(
-                f"Chapter {chap_num} text",
+                f"Chapter {chap_num}",
                 key=f"ch_text_{ch['id']}",
                 height=220,
                 placeholder=f"Paste Chapter {chap_num} here…",
                 label_visibility="collapsed",
             )
-
-            # Keep backing store synced (stable ID prevents scrambling)
             ch["text"] = st.session_state.get(f"ch_text_{ch['id']}", "")
 
-            wc = _section_word_count(ch["text"])
+            wc = _word_count(ch["text"])
             st.caption(f"Chapter {chap_num}: {wc} words • ~{_est_minutes(wc):.1f} min")
 
     st.markdown("---")
     st.markdown("### Outro")
     st.text_area(
-        "Outro text (read exactly as pasted)",
+        "Outro",
         key="outro_text",
         height=220,
         placeholder="Paste your Outro here…",
         label_visibility="collapsed",
     )
-    wc_outro = _section_word_count(st.session_state.outro_text)
+    wc_outro = _word_count(st.session_state.outro_text)
     st.caption(f"Outro: {wc_outro} words • ~{_est_minutes(wc_outro):.1f} min")
+
 
 with right:
     st.subheader("Build")
 
-    # Quick status summary
-    total_words = wc_intro + wc_outro + sum(_section_word_count(c["text"]) for c in st.session_state.chapters)
-    total_min = _est_minutes(total_words)
+    total_words = wc_intro + wc_outro + sum(_word_count(c.get("text", "")) for c in st.session_state.chapters)
     st.metric("Total words", f"{total_words}")
-    st.metric("Estimated narration length", f"~{total_min:.1f} min")
+    st.metric("Estimated duration", f"~{_est_minutes(total_words):.1f} min")
 
     st.markdown("---")
-    st.markdown("#### Actions")
-
-    # Buttons (wired up in Part 3/4)
-    st.button("Create Audio (MP3s)", type="primary", key="create_audio_btn")
-    st.button("Download All MP3s (ZIP)", key="download_zip_btn")
-    st.button("Export Script Backup (ZIP)", key="export_scripts_btn")
+    st.markdown("#### Create Audio")
+    build_clicked = st.button("Generate HQ Audio + Export", type="primary", use_container_width=True)
 
     st.markdown("---")
     st.markdown("#### Last build log")
@@ -322,400 +267,392 @@ with right:
     )
 
 # ============================
-# PART 3/4 — Audio Generation Pipeline (Sequential, Crash-Safe) — FIXED (TTS)
-# Replace your entire Part 3 block with this.
+# PART 3/4 — HQ Audio Pipeline (Onyx → WAV master → Loudness normalize → MP3 320k)
+# Append below Part 2
 # ============================
 
-def _require_api_key(api_key: str) -> bool:
-    if not api_key:
-        st.error("OpenAI API key is required (set it in the sidebar).")
-        return False
-    return True
-
-
-def _collect_sections() -> List[Tuple[str, str]]:
-    sections: List[Tuple[str, str]] = []
-
+def _collect_segments() -> List[Tuple[str, str]]:
+    segs: List[Tuple[str, str]] = []
     intro = (st.session_state.intro_text or "").strip()
     if intro:
-        sections.append(("Intro", intro))
+        segs.append(("intro", intro))
 
-    for idx, ch in enumerate(st.session_state.chapters):
-        text = (ch.get("text") or "").strip()
-        if text:
-            sections.append((f"Chapter_{idx+1:02d}", text))
+    for i, ch in enumerate(st.session_state.chapters, start=1):
+        txt = (ch.get("text") or "").strip()
+        if txt:
+            segs.append((f"chapter_{i:02d}", txt))
 
     outro = (st.session_state.outro_text or "").strip()
     if outro:
-        sections.append(("Outro", outro))
+        segs.append(("outro", outro))
 
-    return sections
+    return segs
 
 
-def _read_audio_response(resp) -> bytes:
-    """
-    SDK-safe: different OpenAI SDK versions return different response objects.
-    """
+def _read_audio_bytes(resp) -> bytes:
     if resp is None:
-        raise RuntimeError("Empty response from TTS API")
-
-    # Newer SDK often provides .read()
+        raise RuntimeError("Empty TTS response")
     if hasattr(resp, "read") and callable(getattr(resp, "read")):
         b = resp.read()
         if isinstance(b, (bytes, bytearray)):
             return bytes(b)
-
-    # Some SDKs expose .content
     if hasattr(resp, "content"):
         b = getattr(resp, "content")
         if isinstance(b, (bytes, bytearray)):
             return bytes(b)
-
-    # Some SDKs might already return bytes
     if isinstance(resp, (bytes, bytearray)):
         return bytes(resp)
-
-    # Fallback: try bytes() coercion
-    try:
-        return bytes(resp)
-    except Exception:
-        raise RuntimeError(f"Unrecognized TTS response type: {type(resp)}")
+    raise RuntimeError(f"Unrecognized TTS response type: {type(resp)}")
 
 
-def _openai_tts_mp3_bytes(*, client: OpenAI, model: str, voice: str, text: str) -> bytes:
+def _tts_mp3_bytes(client: OpenAI, model: str, voice: str, text: str, instructions: str) -> bytes:
     """
-    Generates MP3 bytes from OpenAI TTS.
-    FIX: Use SDK-safe parameter handling (response_format vs format).
-    Reads text exactly as provided.
+    Voice-only TTS. We prepend instructions into the input in a lightweight way.
+    (The model reads exactly what you paste; instructions are guidance.)
     """
-    # Try the most common/current parameter name first:
+    # Keep the guidance short and consistent
+    guided_input = f"[Delivery guidance: {instructions.strip()}]\n\n{text}"
+
+    # SDK-safe response format handling
     try:
         resp = client.audio.speech.create(
             model=model,
             voice=voice,
-            input=text,
+            input=guided_input,
             response_format="mp3",
         )
-        return _read_audio_response(resp)
+        return _read_audio_bytes(resp)
     except TypeError:
-        # Older/newer SDK mismatch: try 'format'
         resp = client.audio.speech.create(
             model=model,
             voice=voice,
-            input=text,
+            input=guided_input,
             format="mp3",
         )
-        return _read_audio_response(resp)
+        return _read_audio_bytes(resp)
 
 
-def _run_ffmpeg(cmd: List[str]) -> Tuple[int, str]:
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        return p.returncode, p.stdout or ""
-    except Exception as e:
-        return 1, f"FFmpeg execution error: {e}"
-
-
-def _apply_padding_mp3(mp3_in: str, mp3_out: str, padding_ms: int) -> Tuple[bool, str]:
-    if padding_ms <= 0:
-        try:
-            with open(mp3_in, "rb") as f_in, open(mp3_out, "wb") as f_out:
-                f_out.write(f_in.read())
-            return True, ""
-        except Exception as e:
-            return False, str(e)
-
+def _mp3_to_wav_master(mp3_in: str, wav_out: str, sr: int) -> Tuple[bool, str]:
     ffmpeg = _ffmpeg_path()
-    pad_s = padding_ms / 1000.0
-
     cmd = [
         ffmpeg, "-y",
-        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={pad_s}",
         "-i", mp3_in,
-        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={pad_s}",
-        "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]",
-        "-map", "[a]",
-        "-c:a", "libmp3lame",
-        mp3_out
+        "-ac", "2",
+        "-ar", str(sr),
+        "-c:a", "pcm_s16le",
+        wav_out,
     ]
-    code, out = _run_ffmpeg(cmd)
+    code, out = _run(cmd)
     return (code == 0), out
 
 
-def _gain_and_mix_music(
-    *,
-    speech_mp3: str,
-    music_path: str,
-    out_mp3: str,
-    speech_gain_db: float,
-    music_volume: float,
-    loop_music: bool,
-    bitrate: str,
-) -> Tuple[bool, str]:
+def _loudnorm_wav(wav_in: str, wav_out: str, target_lufs_i: int, true_peak_db: float, sr: int) -> Tuple[bool, str]:
+    """
+    Two-pass loudnorm for consistent, high-quality voice output.
+    Pass 1 measures; pass 2 applies.
+    """
     ffmpeg = _ffmpeg_path()
 
-    music_input = ["-i", music_path]
-    if loop_music:
-        music_input = ["-stream_loop", "-1", "-i", music_path]
-
-    cmd = [
+    # Pass 1: measure
+    cmd1 = [
         ffmpeg, "-y",
-        "-i", speech_mp3,
-        *music_input,
-        "-filter_complex",
-        (
-            f"[0:a]volume={speech_gain_db}dB[s];"
-            f"[1:a]volume={music_volume}[m];"
-            f"[s][m]amix=inputs=2:duration=shortest:dropout_transition=2[a]"
-        ),
-        "-map", "[a]",
-        "-c:a", "libmp3lame",
-        "-b:a", bitrate,
-        out_mp3,
+        "-i", wav_in,
+        "-af", f"loudnorm=I={target_lufs_i}:TP={true_peak_db}:LRA=11:print_format=json",
+        "-f", "null", "-"
     ]
-    code, out = _run_ffmpeg(cmd)
-    return (code == 0), out
+    code1, out1 = _run(cmd1)
+    if code1 != 0:
+        return False, out1
+
+    # Extract JSON values (simple regex; avoid adding deps)
+    def _pick(key: str) -> Optional[str]:
+        m = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]+)"', out1)
+        return m.group(1) if m else None
+
+    measured_I = _pick("input_i")
+    measured_TP = _pick("input_tp")
+    measured_LRA = _pick("input_lra")
+    measured_thresh = _pick("input_thresh")
+    offset = _pick("target_offset")
+
+    if not all([measured_I, measured_TP, measured_LRA, measured_thresh, offset]):
+        # Sometimes ffmpeg prints json but parsing fails due to formatting; fall back to 1-pass
+        cmd_fallback = [
+            ffmpeg, "-y",
+            "-i", wav_in,
+            "-af", f"loudnorm=I={target_lufs_i}:TP={true_peak_db}:LRA=11",
+            "-ac", "2",
+            "-ar", str(sr),
+            "-c:a", "pcm_s16le",
+            wav_out,
+        ]
+        codef, outf = _run(cmd_fallback)
+        return (codef == 0), outf
+
+    # Pass 2: apply measured values
+    af = (
+        f"loudnorm=I={target_lufs_i}:TP={true_peak_db}:LRA=11:"
+        f"measured_I={measured_I}:measured_TP={measured_TP}:measured_LRA={measured_LRA}:"
+        f"measured_thresh={measured_thresh}:offset={offset}:linear=true:print_format=summary"
+    )
+    cmd2 = [
+        ffmpeg, "-y",
+        "-i", wav_in,
+        "-af", af,
+        "-ac", "2",
+        "-ar", str(sr),
+        "-c:a", "pcm_s16le",
+        wav_out,
+    ]
+    code2, out2 = _run(cmd2)
+    return (code2 == 0), out2
 
 
-def _maybe_gain_only(
-    *,
-    speech_mp3: str,
-    out_mp3: str,
-    speech_gain_db: float,
-    bitrate: str,
-) -> Tuple[bool, str]:
-    if abs(speech_gain_db) < 0.01:
-        try:
-            with open(speech_mp3, "rb") as f_in, open(out_mp3, "wb") as f_out:
-                f_out.write(f_in.read())
-            return True, ""
-        except Exception as e:
-            return False, str(e)
-
+def _wav_to_mp3(wav_in: str, mp3_out: str, bitrate: str) -> Tuple[bool, str]:
     ffmpeg = _ffmpeg_path()
     cmd = [
         ffmpeg, "-y",
-        "-i", speech_mp3,
-        "-filter:a", f"volume={speech_gain_db}dB",
+        "-i", wav_in,
         "-c:a", "libmp3lame",
         "-b:a", bitrate,
-        out_mp3,
+        mp3_out,
     ]
-    code, out = _run_ffmpeg(cmd)
+    code, out = _run(cmd)
     return (code == 0), out
 
 
-def _build_all_mp3s(opts: AudioOptions) -> None:
-    if not _require_api_key(opts.api_key):
+def _concat_wavs(wavs: List[str], wav_out: str) -> Tuple[bool, str]:
+    """
+    Concatenate WAV files using ffmpeg concat demuxer.
+    """
+    ffmpeg = _ffmpeg_path()
+    if not wavs:
+        return False, "No wavs to concatenate."
+
+    with tempfile.TemporaryDirectory() as td:
+        list_path = os.path.join(td, "list.txt")
+        with open(list_path, "w", encoding="utf-8") as f:
+            for w in wavs:
+                f.write(f"file '{w}'\n")
+
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
+            wav_out,
+        ]
+        code, out = _run(cmd)
+        return (code == 0), out
+
+
+def _build_hq_voice_only(
+    *,
+    api_key: str,
+    model: str,
+    voice_name: str,
+    instructions: str,
+    mp3_bitrate: str,
+    sr: int,
+    target_lufs_i: int,
+    true_peak_db: float,
+) -> None:
+    log: List[str] = []
+    st.session_state.last_build_log = ""
+
+    if not api_key.strip():
+        st.error("OpenAI API key is required (set it in the sidebar).")
         return
 
-    sections = _collect_sections()
-    if not sections:
+    segments = _collect_segments()
+    if not segments:
         st.warning("Nothing to generate — all sections are empty.")
         return
 
-    st.session_state.generated_files = {}
-    st.session_state.last_build_log = ""
-
-    client = OpenAI(api_key=opts.api_key)
+    client = OpenAI(api_key=api_key.strip())
 
     proj_slug = _slugify(st.session_state.project_title)
-    log_lines: List[str] = []
+    progress = st.progress(0)
+    status = st.empty()
 
-    with tempfile.TemporaryDirectory() as td:
-        music_path = None
-        if opts.add_music:
-            if not opts.music_bytes:
-                st.error("Music mixing is enabled, but no music file was uploaded in the sidebar.")
-                return
-            music_path = os.path.join(td, "bg_music")
-            with open(music_path, "wb") as f:
-                f.write(opts.music_bytes)
+    per_segment_mp3: Dict[str, bytes] = {}
+    per_segment_wav_master: Dict[str, bytes] = {}  # keep in zip for true HQ if you want
+    norm_wavs_for_full: List[str] = []
 
-        progress = st.progress(0)
-        status = st.empty()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            total = len(segments)
 
-        for i, (base_name, text) in enumerate(sections, start=1):
-            status.write(f"Generating {base_name}… ({i}/{len(sections)})")
+            for idx, (slug, txt) in enumerate(segments, start=1):
+                status.write(f"Generating {slug}… ({idx}/{total})")
 
-            # 1) TTS -> mp3
-            try:
-                raw_mp3 = _openai_tts_mp3_bytes(
-                    client=client,
-                    model=opts.model,
-                    voice=opts.voice,
-                    text=text,
-                )
-            except Exception as e:
-                log_lines.append(f"[ERROR] {base_name}: OpenAI TTS failed: {repr(e)}")
-                st.session_state.last_build_log = "\n".join(log_lines)
-                progress.empty()
-                status.empty()
-                st.error(f"TTS failed on {base_name}. See log.")
-                return
+                # 1) TTS -> MP3 bytes
+                try:
+                    mp3_bytes = _tts_mp3_bytes(client, model, voice_name, txt, instructions)
+                except Exception as e:
+                    log.append(f"[ERROR] {slug}: TTS failed: {repr(e)}")
+                    st.session_state.last_build_log = "\n".join(log)
+                    progress.empty()
+                    status.empty()
+                    st.error(f"TTS failed on {slug}. See log.")
+                    return
 
-            raw_path = os.path.join(td, f"{base_name}_raw.mp3")
-            with open(raw_path, "wb") as f:
-                f.write(raw_mp3)
+                raw_mp3_path = os.path.join(td, f"{slug}_tts.mp3")
+                with open(raw_mp3_path, "wb") as f:
+                    f.write(mp3_bytes)
 
-            # 2) Padding (optional)
-            padded_path = os.path.join(td, f"{base_name}_padded.mp3")
-            ok, out = _apply_padding_mp3(raw_path, padded_path, opts.padding_ms)
+                # 2) Decode to WAV master (consistent SR)
+                wav_master = os.path.join(td, f"{slug}_master.wav")
+                ok, out = _mp3_to_wav_master(raw_mp3_path, wav_master, sr)
+                if not ok:
+                    log.append(f"[ERROR] {slug}: mp3->wav failed\n{out}")
+                    st.session_state.last_build_log = "\n".join(log)
+                    progress.empty()
+                    status.empty()
+                    st.error(f"Audio decode failed on {slug}. See log.")
+                    return
+
+                # 3) Loudness normalize to WAV
+                wav_norm = os.path.join(td, f"{slug}_norm.wav")
+                ok, out = _loudnorm_wav(wav_master, wav_norm, target_lufs_i, true_peak_db, sr)
+                if not ok:
+                    log.append(f"[ERROR] {slug}: loudnorm failed\n{out}")
+                    st.session_state.last_build_log = "\n".join(log)
+                    progress.empty()
+                    status.empty()
+                    st.error(f"Loudness normalization failed on {slug}. See log.")
+                    return
+
+                # 4) Encode final MP3 (single encode after normalization)
+                out_mp3_path = os.path.join(td, f"{slug}.mp3")
+                ok, out = _wav_to_mp3(wav_norm, out_mp3_path, mp3_bitrate)
+                if not ok:
+                    log.append(f"[ERROR] {slug}: wav->mp3 failed\n{out}")
+                    st.session_state.last_build_log = "\n".join(log)
+                    progress.empty()
+                    status.empty()
+                    st.error(f"MP3 encode failed on {slug}. See log.")
+                    return
+
+                with open(out_mp3_path, "rb") as f:
+                    per_segment_mp3[slug] = f.read()
+
+                with open(wav_norm, "rb") as f:
+                    per_segment_wav_master[slug] = f.read()
+
+                norm_wavs_for_full.append(wav_norm)
+
+                log.append(f"[OK] {slug}.mp3")
+                progress.progress(min(1.0, idx / total))
+
+            # 5) Full episode from normalized WAVs -> normalize again lightly -> MP3
+            status.write("Building full episode…")
+            full_wav = os.path.join(td, "full_episode.wav")
+            ok, out = _concat_wavs(norm_wavs_for_full, full_wav)
             if not ok:
-                log_lines.append(f"[ERROR] {base_name}: padding failed\n{out}")
-                st.session_state.last_build_log = "\n".join(log_lines)
+                log.append(f"[ERROR] full: concat failed\n{out}")
+                st.session_state.last_build_log = "\n".join(log)
                 progress.empty()
                 status.empty()
-                st.error(f"Padding failed on {base_name}. See log.")
+                st.error("Full episode concat failed. See log.")
                 return
 
-            # 3) Gain and/or music mix
-            final_path = os.path.join(td, f"{base_name}.mp3")
-            if opts.add_music and music_path is not None:
-                ok, out = _gain_and_mix_music(
-                    speech_mp3=padded_path,
-                    music_path=music_path,
-                    out_mp3=final_path,
-                    speech_gain_db=opts.speech_gain_db,
-                    music_volume=opts.music_volume,
-                    loop_music=opts.music_loop,
-                    bitrate=opts.output_bitrate,
-                )
-                if not ok:
-                    log_lines.append(f"[ERROR] {base_name}: music mix failed\n{out}")
-                    st.session_state.last_build_log = "\n".join(log_lines)
-                    progress.empty()
-                    status.empty()
-                    st.error(f"Music mix failed on {base_name}. See log.")
-                    return
-            else:
-                ok, out = _maybe_gain_only(
-                    speech_mp3=padded_path,
-                    out_mp3=final_path,
-                    speech_gain_db=opts.speech_gain_db,
-                    bitrate=opts.output_bitrate,
-                )
-                if not ok:
-                    log_lines.append(f"[ERROR] {base_name}: gain/apply failed\n{out}")
-                    st.session_state.last_build_log = "\n".join(log_lines)
-                    progress.empty()
-                    status.empty()
-                    st.error(f"Audio processing failed on {base_name}. See log.")
-                    return
-
-            # 4) Read final bytes into memory for downloads
-            try:
-                with open(final_path, "rb") as f:
-                    final_bytes = f.read()
-            except Exception as e:
-                log_lines.append(f"[ERROR] {base_name}: could not read output mp3: {repr(e)}")
-                st.session_state.last_build_log = "\n".join(log_lines)
+            full_norm = os.path.join(td, "full_episode_norm.wav")
+            ok, out = _loudnorm_wav(full_wav, full_norm, target_lufs_i, true_peak_db, sr)
+            if not ok:
+                log.append(f"[ERROR] full: loudnorm failed\n{out}")
+                st.session_state.last_build_log = "\n".join(log)
                 progress.empty()
                 status.empty()
-                st.error(f"Failed reading output for {base_name}. See log.")
+                st.error("Full episode loudness normalization failed. See log.")
                 return
 
-            filename = f"{proj_slug}__{base_name}.mp3"
-            st.session_state.generated_files[filename] = final_bytes
-            log_lines.append(f"[OK] {filename} ({len(final_bytes)/1024/1024:.2f} MB)")
+            full_mp3_path = os.path.join(td, "full_episode.mp3")
+            ok, out = _wav_to_mp3(full_norm, full_mp3_path, mp3_bitrate)
+            if not ok:
+                log.append(f"[ERROR] full: wav->mp3 failed\n{out}")
+                st.session_state.last_build_log = "\n".join(log)
+                progress.empty()
+                status.empty()
+                st.error("Full episode MP3 encode failed. See log.")
+                return
 
-            progress.progress(i / len(sections))
+            with open(full_mp3_path, "rb") as f:
+                full_mp3_bytes = f.read()
 
-        status.write("Done.")
-        progress.empty()
+            # 6) ZIP bundle: scripts + segment MP3s (+ optional normalized WAV masters)
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                # Scripts
+                z.writestr("scripts/intro.txt", st.session_state.intro_text or "")
+                for i, ch in enumerate(st.session_state.chapters, start=1):
+                    z.writestr(f"scripts/chapter_{i:02d}.txt", ch.get("text") or "")
+                z.writestr("scripts/outro.txt", st.session_state.outro_text or "")
 
-    st.session_state.last_build_log = "\n".join(log_lines)
-    st.success(f"Generated {len(st.session_state.generated_files)} MP3 file(s).")
+                # Audio MP3
+                for slug, b in per_segment_mp3.items():
+                    z.writestr(f"audio/mp3/{slug}.mp3", b)
 
+                # Optional: normalized WAV masters for maximum quality
+                for slug, b in per_segment_wav_master.items():
+                    z.writestr(f"audio/wav_norm/{slug}.wav", b)
 
-# Wire the Create Audio button from Part 2
-# IMPORTANT: Do NOT assign to st.session_state.create_audio_btn (widget-owned key).
-if st.session_state.get("create_audio_btn"):
-    _build_all_mp3s(opts)
+            zip_buf.seek(0)
 
-# ============================
-# PART 4/4 — Downloads + Packaging (ZIP) + Script Backup Export — FIXED
-# ============================
+            st.session_state.built = {
+                "zip": zip_buf.getvalue(),
+                "zip_name": f"{proj_slug}__uappress_pack.zip",
+                "full_mp3": full_mp3_bytes,
+                "full_name": f"{proj_slug}__full_episode.mp3",
+            }
 
-def _zip_bytes(file_map: Dict[str, bytes]) -> bytes:
-    bio = io.BytesIO()
-    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for name, b in file_map.items():
-            z.writestr(name, b)
-    return bio.getvalue()
+            progress.empty()
+            status.empty()
+            log.append(f"[OK] full_episode.mp3")
+            st.success("Done! Download below.")
 
-
-def _export_scripts_zip() -> bytes:
-    proj_slug = _slugify(st.session_state.project_title)
-
-    file_map: Dict[str, bytes] = {}
-    intro = (st.session_state.intro_text or "").strip()
-    outro = (st.session_state.outro_text or "").strip()
-
-    if intro:
-        file_map[f"{proj_slug}__Intro.txt"] = intro.encode("utf-8")
-
-    for idx, ch in enumerate(st.session_state.chapters):
-        text = (ch.get("text") or "").strip()
-        if text:
-            file_map[f"{proj_slug}__Chapter_{idx+1:02d}.txt"] = text.encode("utf-8")
-
-    if outro:
-        file_map[f"{proj_slug}__Outro.txt"] = outro.encode("utf-8")
-
-    return _zip_bytes(file_map)
+    finally:
+        st.session_state.last_build_log = "\n".join(log)
 
 
-st.markdown("---")
-st.subheader("Outputs")
-
-generated = st.session_state.generated_files or {}
-
-if not generated:
-    st.caption("No MP3s generated yet.")
-else:
-    st.caption("Download individual MP3s or download everything as a ZIP.")
-
-    for fname, b in generated.items():
-        st.download_button(
-            label=f"Download {fname}",
-            data=b,
-            file_name=fname,
-            mime="audio/mpeg",
-            use_container_width=True,
-            key=f"dl_{fname}",
-        )
-
-
-# ZIP download trigger
-# IMPORTANT: Do NOT assign to st.session_state.download_zip_btn (widget-owned key).
-if st.session_state.get("download_zip_btn"):
-    if not generated:
-        st.warning("No MP3s to zip yet. Click **Create Audio** first.")
-    else:
-        zip_b = _zip_bytes(generated)
-        proj_slug = _slugify(st.session_state.project_title)
-        st.download_button(
-            label="Download ALL MP3s as ZIP",
-            data=zip_b,
-            file_name=f"{proj_slug}__mp3s.zip",
-            mime="application/zip",
-            use_container_width=True,
-            key="dl_all_zip_now",
-        )
-
-
-# Script export trigger
-# IMPORTANT: Do NOT assign to st.session_state.export_scripts_btn (widget-owned key).
-if st.session_state.get("export_scripts_btn"):
-    zip_b = _export_scripts_zip()
-    proj_slug = _slugify(st.session_state.project_title)
-    st.download_button(
-        label="Download Script Backup (ZIP)",
-        data=zip_b,
-        file_name=f"{proj_slug}__scripts.zip",
-        mime="application/zip",
-        use_container_width=True,
-        key="dl_scripts_zip_now",
+# Run build on click (use local variable from Part 2)
+if "build_clicked" in globals() and build_clicked:
+    _build_hq_voice_only(
+        api_key=api_key,
+        model=tts_model,
+        voice_name=voice,
+        instructions=tts_instructions,
+        mp3_bitrate=mp3_bitrate,
+        sr=int(sample_rate),
+        target_lufs_i=int(target_lufs),
+        true_peak_db=float(true_peak),
     )
 
+# ============================
+# PART 4/4 — Downloads (ZIP + Full Episode MP3)
+# Append below Part 3
+# ============================
+
+st.header("4️⃣ Downloads")
+
+built = st.session_state.get("built")
+
+if built:
+    st.download_button(
+        "⬇️ Download ZIP (scripts + segment MP3s + WAV masters)",
+        data=built["zip"],
+        file_name=built["zip_name"],
+        mime="application/zip",
+    )
+
+    st.audio(built["full_mp3"], format="audio/mp3")
+
+    st.download_button(
+        "⬇️ Download Full Episode MP3",
+        data=built["full_mp3"],
+        file_name=built["full_name"],
+        mime="audio/mpeg",
+    )
+else:
+    st.caption("After you generate audio, your download buttons will appear here.")
