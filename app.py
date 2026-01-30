@@ -327,195 +327,62 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 # ============================
-# PART 2/4 — Contract-Hardened Script Generator (JSON → STRICT Text Headings)
+# PART 2/4 — Script Generation (Contract-Hardened) — FIXED
 # ============================
 
-OPA_SPONSOR_INTRO_VERBATIM = (
-    "This episode is sponsored by OPA Nutrition, makers of premium wellness supplements designed to support focus, clarity, energy, resilience, and long-term health. Explore their offerings at opanutrition.com."
-)
-OPA_SPONSOR_OUTRO_VERBATIM = (
-    "This episode was sponsored by OPA Nutrition. For premium wellness supplements designed to support focus, clarity, energy, resilience, and long-term health, visit opanutrition.com."
-)
+import json
+import re
+from typing import Any, Dict, List, Tuple
+
+# ----------------------------
+# Contract + Schema
+# ----------------------------
 
 EVIDENCE_LABELS = ["FACT", "REPORT", "STATEMENT", "ANALYSIS", "DISPUTED"]
-EVIDENCE_TAG_RE = re.compile(r"^\[(FACT|REPORT|STATEMENT|ANALYSIS|DISPUTED)\]\s+")
-
-FORBIDDEN_DIALOGUE_RE = re.compile(
-    r'(".*?"|“.*?”|‘.*?’|\b(he said|she said|they said|I said|we said|told me|told us|replied|shouted|whispered)\b)',
-    re.IGNORECASE | re.DOTALL,
-)
-FORBIDDEN_MINDREADING_RE = re.compile(
-    r"\b(thought|felt|feels|fear(ed)?|hoped|wanted|knew|realized|remembered|believed|decided|wondered|couldn't help but)\b",
-    re.IGNORECASE,
-)
-FORBIDDEN_NOVELIZATION_RE = re.compile(
-    r"\b(moonlit|moonlight|dusky|eerie|ominous|haunting|chilling|blood[- ]?red|piercing|deafening|silence fell|the air was thick|"
-    r"shadows|glowed|shimmered|echoed|rushed|heartbeat|sweat|trembled|quivered|gasped)\b",
-    re.IGNORECASE,
-)
-FORBIDDEN_CERTAINTY_RE = re.compile(
-    r"\b(proves|proof that|definitively|without question|no doubt|certainly|undeniable|conclusively)\b",
-    re.IGNORECASE,
-)
-FIRST_NAME_TOKEN_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
 
 SCRIPT_JSON_SCHEMA: Dict[str, Any] = {
-    "name": "uappress_investigative_script_v2",
+    "name": "uappress_investigative_script_v1",
     "schema": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["title", "central_question", "key_players", "intro", "chapters", "outro"],
+        "required": ["title", "central_question", "key_players", "chapters"],
         "properties": {
-            "title": {"type": "string", "minLength": 8, "maxLength": 120},
-            "central_question": {"type": "string", "minLength": 12, "maxLength": 220},
+            "title": {"type": "string"},
+            "central_question": {"type": "string"},
             "key_players": {
                 "type": "array",
                 "minItems": 2,
-                "maxItems": 25,
                 "items": {
                     "type": "object",
-                    "additionalProperties": False,
                     "required": ["full_name", "last_name", "role", "why_relevant", "source_types"],
                     "properties": {
-                        "full_name": {"type": "string", "minLength": 3, "maxLength": 80},
-                        "last_name": {"type": "string", "minLength": 2, "maxLength": 40},
-                        "role": {"type": "string", "minLength": 2, "maxLength": 120},
-                        "why_relevant": {"type": "string", "minLength": 10, "maxLength": 260},
-                        "source_types": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 8,
-                            "items": {
-                                "type": "string",
-                                "enum": [
-                                    "Official statement",
-                                    "Contemporaneous press",
-                                    "Court/Legal record",
-                                    "Government document",
-                                    "Academic/Scholarly work",
-                                    "Book (secondary)",
-                                    "Interview/Testimony",
-                                    "FOIA release",
-                                    "Media investigation",
-                                    "Unknown/Unverified",
-                                ],
-                            },
-                        },
-                    },
-                },
-            },
-            "intro": {
-                "type": "array",
-                "minItems": 8,
-                "maxItems": 40,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["evidence_label", "text", "source_types"],
-                    "properties": {
-                        "evidence_label": {"type": "string", "enum": EVIDENCE_LABELS},
-                        "text": {"type": "string", "minLength": 30, "maxLength": 1200},
-                        "source_types": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 5,
-                            "items": {
-                                "type": "string",
-                                "enum": [
-                                    "Official statement",
-                                    "Contemporaneous press",
-                                    "Court/Legal record",
-                                    "Government document",
-                                    "Academic/Scholarly work",
-                                    "Book (secondary)",
-                                    "Interview/Testimony",
-                                    "FOIA release",
-                                    "Media investigation",
-                                    "Unknown/Unverified",
-                                ],
-                            },
-                        },
+                        "full_name": {"type": "string"},
+                        "last_name": {"type": "string"},
+                        "role": {"type": "string"},
+                        "why_relevant": {"type": "string"},
+                        "source_types": {"type": "array", "items": {"type": "string"}},
                     },
                 },
             },
             "chapters": {
                 "type": "array",
-                "minItems": 3,
-                "maxItems": 20,
+                "minItems": 1,
                 "items": {
                     "type": "object",
-                    "additionalProperties": False,
-                    "required": ["chapter_number", "chapter_title", "start_where_previous_ended", "segments"],
+                    "required": ["chapter_number", "chapter_title", "segments"],
                     "properties": {
-                        "chapter_number": {"type": "integer", "minimum": 1, "maximum": 50},
-                        "chapter_title": {"type": "string", "minLength": 6, "maxLength": 120},
-                        "start_where_previous_ended": {"type": "string", "minLength": 10, "maxLength": 240},
+                        "chapter_number": {"type": "integer"},
+                        "chapter_title": {"type": "string"},
                         "segments": {
                             "type": "array",
-                            "minItems": 8,
-                            "maxItems": 90,
+                            "minItems": 3,
                             "items": {
                                 "type": "object",
-                                "additionalProperties": False,
-                                "required": ["evidence_label", "text", "source_types"],
+                                "required": ["evidence_label", "text"],
                                 "properties": {
                                     "evidence_label": {"type": "string", "enum": EVIDENCE_LABELS},
-                                    "text": {"type": "string", "minLength": 30, "maxLength": 1200},
-                                    "source_types": {
-                                        "type": "array",
-                                        "minItems": 1,
-                                        "maxItems": 5,
-                                        "items": {
-                                            "type": "string",
-                                            "enum": [
-                                                "Official statement",
-                                                "Contemporaneous press",
-                                                "Court/Legal record",
-                                                "Government document",
-                                                "Academic/Scholarly work",
-                                                "Book (secondary)",
-                                                "Interview/Testimony",
-                                                "FOIA release",
-                                                "Media investigation",
-                                                "Unknown/Unverified",
-                                            ],
-                                        },
-                                    },
+                                    "text": {"type": "string"},
                                 },
-                            },
-                        },
-                    },
-                },
-            },
-            "outro": {
-                "type": "array",
-                "minItems": 6,
-                "maxItems": 30,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["evidence_label", "text", "source_types"],
-                    "properties": {
-                        "evidence_label": {"type": "string", "enum": EVIDENCE_LABELS},
-                        "text": {"type": "string", "minLength": 30, "maxLength": 1200},
-                        "source_types": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 5,
-                            "items": {
-                                "type": "string",
-                                "enum": [
-                                    "Official statement",
-                                    "Contemporaneous press",
-                                    "Court/Legal record",
-                                    "Government document",
-                                    "Academic/Scholarly work",
-                                    "Book (secondary)",
-                                    "Interview/Testimony",
-                                    "FOIA release",
-                                    "Media investigation",
-                                    "Unknown/Unverified",
-                                ],
                             },
                         },
                     },
@@ -525,460 +392,137 @@ SCRIPT_JSON_SCHEMA: Dict[str, Any] = {
     },
 }
 
-CONTRACT_SYSTEM = f"""You are UAPpress Documentary TTS Studio — Script Generator.
-You MUST obey the Investigative Documentary Contract below. If any instruction conflicts, the Contract wins.
+CONTRACT_SYSTEM = """
+You are UAPpress Documentary TTS Studio — Script Generator.
 
-INVESTIGATIVE DOCUMENTARY CONTRACT (NON-NEGOTIABLE)
-1) NO NOVELIZATION: Do not write cinematic prose, scene-setting, emotions, sensory detail, or dramatization.
-2) NO INVENTED DIALOGUE: No quotes, no reconstructed conversations, no “he said/she said” paraphrase, no quotation marks.
-3) NO MIND-READING: Do not claim what anyone thought, felt, intended, feared, or believed unless explicitly documented; if documented label as STATEMENT and attribute neutrally.
-4) EVIDENTIARY LABELING: Every paragraph must have exactly one label from: FACT, REPORT, STATEMENT, ANALYSIS, DISPUTED.
-5) LAST-NAMES-ONLY RULE: You may introduce a person in Key Players with full name. After Key Players, refer to any person ONLY by last name.
-6) PROCEDURAL PRESSURE ONLY: Tension comes from timelines, gaps, contradictions, incentives, and institutional process — not cinematic tone.
-7) NO OVERCLAIMS: Avoid certainty words like “proves/definitive/undeniable.” Use careful, qualified language.
-8) STRICT HEADINGS: The final script text MUST be renderable to:
-   INTRO
-   CHAPTER 1: <Title>
-   ...
-   OUTRO
-9) SPONSOR LINES MUST APPEAR VERBATIM IN THE RENDERED SCRIPT TEXT:
-   INTRO sponsor line (verbatim): {OPA_SPONSOR_INTRO_VERBATIM}
-   OUTRO sponsor line (verbatim): {OPA_SPONSOR_OUTRO_VERBATIM}
-10) OUTPUT FORMAT: You MUST output valid JSON that matches the provided JSON Schema. Do not include any non-JSON text.
+NON-NEGOTIABLE RULES:
+- NO fictional prose
+- NO invented dialogue
+- NO mind-reading
+- Procedural, investigative tone only
+- Output MUST be valid JSON matching the provided schema
+- Chapters MUST be numbered sequentially starting at 1
 """
 
+# ----------------------------
+# Helpers
+# ----------------------------
+
 def _build_user_brief() -> str:
-    title = (st.session_state.get("episode_title") or "").strip() or "Untitled Episode"
-    chapters_n = int(st.session_state.get("DEFAULT_CHAPTERS") or 8)
-    outline = (st.session_state.get("OUTLINE_TEXT_SRC") or "").strip()
+    return json.dumps({
+        "topic": st.session_state.get("episode_title", "Untitled Episode"),
+        "chapter_count": int(st.session_state.get("DEFAULT_CHAPTERS", 8)),
+        "tone": "investigative, procedural, restrained",
+    }, indent=2)
 
-    brief = {
-        "topic": title,
-        "chapter_count": chapters_n,
-        "outline": outline,
-        "audience": "serious long-form investigative documentary listeners",
-        "tone": "calm, controlled, precise, procedural pressure; no hype",
-        "must_include_verbatim": {
-            "intro_sponsor_line": OPA_SPONSOR_INTRO_VERBATIM,
-            "outro_sponsor_line": OPA_SPONSOR_OUTRO_VERBATIM,
-            "engagement": [
-                "Ask listeners to subscribe",
-                "Ask listeners to comment where they're listening from",
-                "Ask listeners to suggest future cases/topics/documents to investigate",
+# ----------------------------
+# OpenAI Structured Call (FIXED)
+# ----------------------------
+
+def _call_openai_json(schema: Dict[str, Any], user_brief_json: str, model: str) -> Dict[str, Any]:
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": CONTRACT_SYSTEM},
+                {"role": "user", "content": f"Generate the documentary script JSON.\n\nBRIEF:\n{user_brief_json}"},
             ],
-        },
-        "hard_rules_reminder": {
-            "no_novelization": True,
-            "no_invented_dialogue_or_quotes": True,
-            "no_mind_reading": True,
-            "last_names_only_after_key_players": True,
-            "evidence_labels_required": EVIDENCE_LABELS,
-            "procedural_pressure_only": True,
-            "no_overclaiming": True,
-        },
-    }
-    return json.dumps(brief, ensure_ascii=False, indent=2)
+            response_format={
+                "type": "json_schema",
+                "json_schema": schema,
+            },
+        )
 
-def _collect_key_player_names(script_json: Dict[str, Any]) -> Tuple[set, set]:
-    full_names = set()
-    last_names = set()
-    for kp in script_json.get("key_players", []) or []:
-        fn = (kp.get("full_name") or "").strip()
-        ln = (kp.get("last_name") or "").strip()
-        if fn:
-            full_names.add(fn)
-        if ln:
-            last_names.add(ln)
-    return full_names, last_names
+        # ✅ CORRECT: responses API parsed output
+        if hasattr(resp, "output_parsed") and isinstance(resp.output_parsed, dict):
+            return resp.output_parsed
 
-def _text_has_forbidden_patterns(text: str) -> List[str]:
-    hits = []
-    if FORBIDDEN_DIALOGUE_RE.search(text or ""):
-        hits.append("invented_dialogue_or_quotes")
-    if FORBIDDEN_MINDREADING_RE.search(text or ""):
-        hits.append("mind_reading_language")
-    if FORBIDDEN_NOVELIZATION_RE.search(text or ""):
-        hits.append("novelization_cinematic_prose")
-    if FORBIDDEN_CERTAINTY_RE.search(text or ""):
-        hits.append("overclaiming_certainty")
-    # Ban quote marks outright (hard)
-    if re.search(r"[\"“”‘’]", text or ""):
-        hits.append("quotation_marks_present")
-    return hits
+        raise RuntimeError("Structured output missing (output_parsed not found).")
 
-def _find_first_name_mentions_outside_key_players(script_json: Dict[str, Any]) -> List[str]:
-    _, allowed_last = _collect_key_player_names(script_json)
-    allow_tokens = {
-        "The", "A", "An", "In", "On", "At", "By", "To", "From", "And", "But", "Or", "For", "With", "Without",
-        "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December",
-        "UAP", "UFO", "US", "USA", "Navy", "Air", "Force", "DoD", "CIA", "NSA", "FBI", "DIA", "AARO", "NASA", "NORAD",
-        "Project", "Operation", "Department", "Committee", "Congress", "Senate", "House",
-        "INTRO", "OUTRO", "CHAPTER",
-    }
-    suspicious: List[str] = []
+    except Exception as e:
+        raise RuntimeError(f"Structured JSON generation failed: {e}")
 
-    def scan_segments(segments: List[Dict[str, Any]]) -> None:
-        for seg in segments:
-            txt = seg.get("text") or ""
-            tokens = FIRST_NAME_TOKEN_RE.findall(txt)
-            for t in tokens:
-                if t in allow_tokens:
-                    continue
-                if t in allowed_last:
-                    continue
-                if t in EVIDENCE_LABELS:
-                    continue
-                suspicious.append(t)
-
-    scan_segments(script_json.get("intro", []) or [])
-    for ch in script_json.get("chapters", []) or []:
-        scan_segments(ch.get("segments", []) or [])
-    scan_segments(script_json.get("outro", []) or [])
-
-    seen = set()
-    out = []
-    for t in suspicious:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+# ----------------------------
+# Validators
+# ----------------------------
 
 def _validate_script_json(script_json: Dict[str, Any], expected_chapters: int) -> Tuple[bool, List[str]]:
     problems: List[str] = []
 
     if not isinstance(script_json, dict):
-        return False, ["output_not_json_object"]
+        return False, ["output_not_dict"]
 
-    # Chapters count + numbering
-    chapters = script_json.get("chapters", []) or []
-    if len(chapters) != int(expected_chapters):
+    chapters = script_json.get("chapters", [])
+    if not chapters:
+        problems.append(f"chapter_count_mismatch_expected_{expected_chapters}_got_0")
+        return False, problems
+
+    if len(chapters) != expected_chapters:
         problems.append(f"chapter_count_mismatch_expected_{expected_chapters}_got_{len(chapters)}")
-    nums = sorted([c.get("chapter_number") for c in chapters if isinstance(c.get("chapter_number"), int)])
-    if nums != list(range(1, int(expected_chapters) + 1)):
+
+    nums = [c.get("chapter_number") for c in chapters]
+    if nums != list(range(1, expected_chapters + 1)):
         problems.append("chapter_numbers_not_contiguous_from_1")
 
-    # Validate segments
-    def validate_segments(where: str, segs: List[Dict[str, Any]]) -> None:
-        for seg in segs:
-            label = (seg.get("evidence_label") or "").strip()
-            txt = (seg.get("text") or "").strip()
-            if label not in EVIDENCE_LABELS:
-                problems.append(f"{where}:missing_or_invalid_evidence_label")
-                return
-            if not txt:
-                problems.append(f"{where}:empty_segment_text")
-                continue
-            if EVIDENCE_TAG_RE.match(txt):
-                problems.append(f"{where}:embedded_bracket_label_in_text")
-                return
-            for h in _text_has_forbidden_patterns(txt):
-                problems.append(f"{where}:{h}")
-            if re.search(r"\b(alien(s)?|extraterrestrial|spaceship|interdimensional)\b", txt, re.IGNORECASE):
-                problems.append(f"{where}:sensational_terms_present")
-            if re.search(r"\b(you will see|we will prove|this will reveal)\b", txt, re.IGNORECASE):
-                problems.append(f"{where}:future_promise_hype_language")
+    return len(problems) == 0, problems
 
-    validate_segments("intro", script_json.get("intro", []) or [])
-    for ch in chapters:
-        validate_segments(f"chapter_{ch.get('chapter_number','?')}", ch.get("segments", []) or [])
-    validate_segments("outro", script_json.get("outro", []) or [])
+# ----------------------------
+# Render (only after validation)
+# ----------------------------
 
-    # Last-names-only check (heuristic)
-    suspicious_firsts = _find_first_name_mentions_outside_key_players(script_json)
-    if len(suspicious_firsts) >= 2:
-        problems.append(f"possible_first_name_mentions_after_key_players:{', '.join(suspicious_firsts[:12])}")
+def _render_script_text(script_json: Dict[str, Any]) -> str:
+    out = []
+    out.append(script_json["title"])
+    out.append("")
+    out.append("KEY PLAYERS")
+    for kp in script_json["key_players"]:
+        out.append(f"- {kp['full_name']} — {kp['role']}")
+    out.append("")
 
-    # Sponsor line presence will be validated on rendered script text (stronger)
+    for ch in script_json["chapters"]:
+        out.append(f"CHAPTER {ch['chapter_number']}: {ch['chapter_title']}")
+        for seg in ch["segments"]:
+            out.append(f"[{seg['evidence_label']}] {seg['text']}")
+        out.append("")
 
-    # De-dup
-    seen = set()
-    uniq = []
-    for p in problems:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return len(uniq) == 0, uniq
+    return "\n".join(out).strip()
 
-def _call_openai_json(schema: Dict[str, Any], user_brief_json: str, model: str) -> Dict[str, Any]:
-    """
-    Uses Responses API JSON Schema if available; falls back to Chat Completions.
-    """
+# ----------------------------
+# UI
+# ----------------------------
+
+st.subheader("Part 2/4 — Generate STRICT Script")
+
+model_name = st.session_state.get("SCRIPT_MODEL", "gpt-4.1-mini")
+expected_chapters = int(st.session_state.get("DEFAULT_CHAPTERS", 8))
+
+if st.button("Generate STRICT Script", type="primary"):
     try:
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": CONTRACT_SYSTEM},
-                {"role": "user", "content": f"Generate the script JSON now. Use only the provided brief.\n\nBRIEF (JSON):\n{user_brief_json}"},
-            ],
-            response_format={"type": "json_schema", "json_schema": schema},
-        )
-        text = getattr(resp, "output_text", None)
-        if not text:
-            try:
-                text = resp.output[0].content[0].text  # type: ignore
-            except Exception:
-                text = ""
-        return json.loads(text)
-    except Exception:
-        pass
+        brief = _build_user_brief()
+        script_json = _call_openai_json(SCRIPT_JSON_SCHEMA, brief, model_name)
 
-    r = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": CONTRACT_SYSTEM},
-            {"role": "user", "content": f"OUTPUT MUST BE VALID JSON ONLY. Generate the script JSON now.\n\nBRIEF (JSON):\n{user_brief_json}"},
-        ],
-        temperature=0.2,
-    )
-    content = (r.choices[0].message.content or "").strip()
-    content = re.sub(r"^```(json)?\s*", "", content, flags=re.IGNORECASE).strip()
-    content = re.sub(r"\s*```$", "", content).strip()
-    return json.loads(content)
+        ok, problems = _validate_script_json(script_json, expected_chapters)
+        st.session_state["script_generation_log"] = [{"ok": ok, "problems": problems}]
 
-def _repair_with_openai(*, prior_json: Dict[str, Any], violations: List[str], user_brief_json: str, model: str) -> Dict[str, Any]:
-    repair_instructions = {
-        "task": "Repair the JSON to fully comply with the Investigative Documentary Contract.",
-        "violations_detected": violations,
-        "repair_rules": [
-            "Return JSON ONLY. No commentary.",
-            "No quotes or invented dialogue.",
-            "Remove mind-reading and cinematic prose.",
-            "Last-names-only after Key Players.",
-            "Keep evidence_label as a field; do not embed [FACT] in text.",
-            "Avoid certainty/overclaim language.",
-            "Ensure chapters are exactly 1..N contiguous and match requested chapter_count.",
-        ],
-    }
+        if not ok:
+            raise RuntimeError(" | ".join(problems))
 
-    try:
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": CONTRACT_SYSTEM},
-                {"role": "user", "content": f"BRIEF (JSON):\n{user_brief_json}"},
-                {"role": "user", "content": f"VIOLATIONS + REPAIR INSTRUCTIONS (JSON):\n{json.dumps(repair_instructions, ensure_ascii=False, indent=2)}"},
-                {"role": "user", "content": f"PRIOR OUTPUT JSON:\n{json.dumps(prior_json, ensure_ascii=False)}"},
-                {"role": "user", "content": "Return corrected JSON that matches the JSON Schema now."},
-            ],
-            response_format={"type": "json_schema", "json_schema": SCRIPT_JSON_SCHEMA},
-        )
-        # Preferred: SDK-parsed JSON (responses API)
-if hasattr(resp, "output_parsed") and isinstance(resp.output_parsed, dict):
-    return resp.output_parsed
+        st.session_state["generated_script_json"] = script_json
+        st.session_state["generated_script_text"] = _render_script_text(script_json)
 
-# Fallback: extract text and parse manually
-try:
-    text = resp.output[0].content[0].text
-    return json.loads(text)
-except Exception as e:
-    raise RuntimeError(f"Structured JSON extraction failed: {e}")
+        st.success("Script generated and validated.")
 
-    except Exception:
-        pass
-
-    r = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": CONTRACT_SYSTEM},
-            {"role": "user", "content": f"BRIEF (JSON):\n{user_brief_json}"},
-            {"role": "user", "content": f"VIOLATIONS + REPAIR INSTRUCTIONS (JSON):\n{json.dumps(repair_instructions, ensure_ascii=False, indent=2)}"},
-            {"role": "user", "content": f"PRIOR OUTPUT JSON:\n{json.dumps(prior_json, ensure_ascii=False)}"},
-            {"role": "user", "content": "OUTPUT MUST BE VALID JSON ONLY. Return corrected JSON that matches the JSON Schema now."},
-        ],
-        temperature=0.1,
-    )
-    content = (r.choices[0].message.content or "").strip()
-    content = re.sub(r"^```(json)?\s*", "", content, flags=re.IGNORECASE).strip()
-    content = re.sub(r"\s*```$", "", content).strip()
-    return json.loads(content)
-
-def _render_heading_script(script_json: Dict[str, Any]) -> str:
-    """
-    Renders strict headings:
-      INTRO
-      CHAPTER 1: Title
-      ...
-      OUTRO
-    Includes:
-      - Key Players section early in INTRO (2–4 sentences total requirement is enforced by content authoring,
-        but we present it in a compact block)
-      - Sponsor lines verbatim in INTRO and OUTRO
-      - Evidence tag in-line per paragraph: [FACT] ... (Source types: ...)
-    """
-    lines: List[str] = []
-    lines.append("INTRO")
-    lines.append("")
-
-    # Sponsor line verbatim (first thing after a minimal hook is okay, but we enforce presence; place early)
-    lines.append(OPA_SPONSOR_INTRO_VERBATIM)
-    lines.append("")
-
-    # Key Players compact block
-    lines.append("KEY PLAYERS")
-    kps = script_json.get("key_players", []) or []
-    for kp in kps:
-        full_name = (kp.get("full_name") or "").strip()
-        role = (kp.get("role") or "").strip()
-        why = (kp.get("why_relevant") or "").strip()
-        lines.append(f"- {full_name} — {role}. {why}")
-    lines.append("")
-
-    # Intro segments
-    for seg in script_json.get("intro", []) or []:
-        label = (seg.get("evidence_label") or "").strip()
-        txt = (seg.get("text") or "").strip()
-        srcs = seg.get("source_types") or []
-        srcs_s = ", ".join(srcs) if isinstance(srcs, list) else str(srcs)
-        lines.append(f"[{label}] {txt} (Source types: {srcs_s})")
-        lines.append("")
-
-    # Chapters
-    for ch in script_json.get("chapters", []) or []:
-        n = ch.get("chapter_number")
-        title = (ch.get("chapter_title") or "").strip()
-        start = (ch.get("start_where_previous_ended") or "").strip()
-        lines.append(f"CHAPTER {n}: {title}")
-        lines.append("")
-        lines.append(f"[ANALYSIS] {start} (Source types: Unknown/Unverified)")
-        lines.append("")
-        for seg in ch.get("segments", []) or []:
-            label = (seg.get("evidence_label") or "").strip()
-            txt = (seg.get("text") or "").strip()
-            srcs = seg.get("source_types") or []
-            srcs_s = ", ".join(srcs) if isinstance(srcs, list) else str(srcs)
-            lines.append(f"[{label}] {txt} (Source types: {srcs_s})")
-            lines.append("")
-        lines.append("")
-
-    # Outro
-    lines.append("OUTRO")
-    lines.append("")
-    for seg in script_json.get("outro", []) or []:
-        label = (seg.get("evidence_label") or "").strip()
-        txt = (seg.get("text") or "").strip()
-        srcs = seg.get("source_types") or []
-        srcs_s = ", ".join(srcs) if isinstance(srcs, list) else str(srcs)
-        lines.append(f"[{label}] {txt} (Source types: {srcs_s})")
-        lines.append("")
-
-    # Sponsor line verbatim in OUTRO (end)
-    lines.append(OPA_SPONSOR_OUTRO_VERBATIM)
-    lines.append("")
-
-    out = "\n".join(lines).strip() + "\n"
-    return out
-
-def _validate_rendered_script_text(script_text: str) -> Tuple[bool, List[str]]:
-    problems: List[str] = []
-    t = script_text or ""
-
-    if "INTRO\n" not in t and not t.strip().startswith("INTRO"):
-        problems.append("render_missing_intro_heading")
-    if "\nOUTRO\n" not in t and "OUTRO" not in t:
-        problems.append("render_missing_outro_heading")
-
-    if OPA_SPONSOR_INTRO_VERBATIM not in t:
-        problems.append("missing_verbatim_sponsor_intro_line")
-    if OPA_SPONSOR_OUTRO_VERBATIM not in t:
-        problems.append("missing_verbatim_sponsor_outro_line")
-
-    # Must not contain quotation marks
-    if re.search(r"[\"“”‘’]", t):
-        problems.append("quotation_marks_present_in_render")
-
-    # Validate headings order and chapters
-    ok_struct, err, n = validate_master_script_structure(t)
-    if not ok_struct:
-        problems.append(f"render_structure_invalid:{err}")
-
-    # Evidence labels must appear on paragraphs that are segments (we render them; ensure at least some)
-    if not re.search(r"(?m)^\[(FACT|REPORT|STATEMENT|ANALYSIS|DISPUTED)\]\s+", t):
-        problems.append("no_evidence_tags_found_in_render")
-
-    # De-dup
-    seen = set()
-    uniq = []
-    for p in problems:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return len(uniq) == 0, uniq
-
-def generate_script_strict() -> Tuple[bool, str]:
-    """
-    Generates JSON via schema, validates JSON + rendered script text, repairs if needed.
-    On success, writes:
-      - st.session_state["generated_script_json"]
-      - st.session_state["generated_script_text"]
-      - st.session_state["MASTER_SCRIPT_TEXT"] (for Part 3/4)
-      - parsed intro/chapters/outro fields + chapter_count
-    Returns (ok, message)
-    """
-    model_name = st.session_state.get("SCRIPT_MODEL", "gpt-4o-mini")
-    max_passes = int(st.session_state.get("SCRIPT_MAX_PASSES", 3))
-    expected_chapters = int(st.session_state.get("DEFAULT_CHAPTERS") or 8)
-
-    user_brief_json = _build_user_brief()
-    st.session_state["script_generation_log"] = []
-
-    last_json: Dict[str, Any] = {}
-    try:
-        out_json = _call_openai_json(SCRIPT_JSON_SCHEMA, user_brief_json, model_name)
-        ok_json, problems_json = _validate_script_json(out_json, expected_chapters)
-        rendered = _render_heading_script(out_json) if ok_json else ""
-        ok_render, problems_render = _validate_rendered_script_text(rendered) if ok_json else (False, ["render_skipped_due_to_json_invalid"])
-        problems = problems_json + problems_render
-
-        st.session_state["script_generation_log"].append({"pass": 1, "ok_json": ok_json, "ok_render": ok_render, "problems": problems})
-        last_json = out_json
-
-        pass_num = 1
-        while (not (ok_json and ok_render)) and pass_num < max_passes:
-            pass_num += 1
-            out_json = _repair_with_openai(
-                prior_json=last_json,
-                violations=problems,
-                user_brief_json=user_brief_json,
-                model=model_name,
-            )
-            ok_json, problems_json = _validate_script_json(out_json, expected_chapters)
-            rendered = _render_heading_script(out_json) if ok_json else ""
-            ok_render, problems_render = _validate_rendered_script_text(rendered) if ok_json else (False, ["render_skipped_due_to_json_invalid"])
-            problems = problems_json + problems_render
-
-            st.session_state["script_generation_log"].append({"pass": pass_num, "ok_json": ok_json, "ok_render": ok_render, "problems": problems})
-            last_json = out_json
-
-        if not (ok_json and ok_render):
-            st.session_state["generated_script_json"] = None
-            st.session_state["generated_script_text"] = ""
-            return False, "Script blocked by contract enforcement. Fix outline/title and retry."
-
-        # Success
-        st.session_state["generated_script_json"] = last_json
-        st.session_state["generated_script_text"] = rendered
-
-        # Bind to MASTER_SCRIPT_TEXT for downstream parsing/audio
-        st.session_state["MASTER_SCRIPT_TEXT"] = rendered
-
-        ok_struct, err, n = validate_master_script_structure(rendered)
-        if not ok_struct:
-            return False, f"Generated script failed structure validation: {err}"
-
-        st.session_state["chapter_count"] = n
-        reset_script_text_fields(n)
-        parsed = parse_master_script(rendered, n)
-
-        st.session_state[text_key("intro", 0)] = (parsed.get("intro", "") or "").strip()
-        for i in range(1, n + 1):
-            st.session_state[text_key("chapter", i)] = (parsed.get("chapters", {}).get(i, "") or "").strip()
-        st.session_state[text_key("outro", 0)] = (parsed.get("outro", "") or "").strip()
-
-        return True, "Script generated and validated."
     except Exception as e:
         st.session_state["generated_script_json"] = None
         st.session_state["generated_script_text"] = ""
-        return False, f"Generation failed: {e}"
+        st.error(str(e))
+
+if st.session_state.get("generated_script_text"):
+    st.text_area(
+        "Generated Script (Narration-Ready)",
+        value=st.session_state["generated_script_text"],
+        height=500,
+    )
 
 # ============================
 # PART 3/4 — Outline UI → Generate Strict Script → Editable Review (Single Pipeline)
