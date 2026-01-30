@@ -327,279 +327,311 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 # ============================
-# PART 2/4 — STRICT Script JSON Generation + Contract Enforcement (CRASH-SAFE)
+# PART 2/4 — STRICT Script Generation (FIX: no-arg wrapper + safe state writes)
+# Paste this WHOLE block to replace your existing Part 2/4 top-to-bottom.
 # ============================
-# ✅ Fixes: TypeError from calling generate_script_strict() at import-time
-# ✅ Fixes: 'str' object has no attribute 'get' by robust JSON extraction
-# ✅ Fixes: chapter_count mismatch by validating and enforcing contiguous chapters
-#
-# Paste this as your PART 2/4 block (replace your existing PART 2 entirely).
-# Requires: `import json, re` already in Part 1/4 imports.
 
 from typing import Any, Dict, List, Tuple, Optional
-
+import json
+import re
 
 # ----------------------------
-# JSON extraction helpers
+# Robust JSON extraction
 # ----------------------------
 
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+_JSON_OBJ = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Tries hard to pull a JSON object out of model output.
-    Returns dict or None.
-    """
-    if not text or not isinstance(text, str):
+    if not isinstance(text, str):
         return None
+    s = text.strip()
 
-    text = text.strip()
+    # fenced ```json
+    m = _JSON_FENCE.search(s)
+    if m:
+        s = m.group(1).strip()
 
-    # Direct parse first
+    # direct parse
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
     except Exception:
         pass
 
-    # Try to find the first {...} blob
-    m = _JSON_RE.search(text)
-    if not m:
+    # find first {...}
+    m2 = _JSON_OBJ.search(s)
+    if not m2:
         return None
-
-    blob = m.group(0).strip()
     try:
-        obj = json.loads(blob)
-        if isinstance(obj, dict):
-            return obj
+        obj = json.loads(m2.group(0))
+        return obj if isinstance(obj, dict) else None
     except Exception:
         return None
 
-    return None
 
-
-def _response_text(resp: Any) -> str:
-    """
-    Supports multiple OpenAI SDK response shapes without crashing.
-    """
-    # Newer SDK convenience
-    for attr in ("output_text", "text"):
-        if hasattr(resp, attr):
-            v = getattr(resp, attr)
-            if isinstance(v, str) and v.strip():
-                return v
-
-    # Some SDKs keep content in output[0].content[0].text
+def _resp_text(resp: Any) -> str:
+    v = getattr(resp, "output_text", None)
+    if isinstance(v, str) and v.strip():
+        return v.strip()
     try:
         out = getattr(resp, "output", None)
-        if out and isinstance(out, list):
+        if isinstance(out, list):
+            parts: List[str] = []
             for item in out:
                 content = getattr(item, "content", None)
-                if content and isinstance(content, list):
+                if isinstance(content, list):
                     for c in content:
                         t = getattr(c, "text", None)
                         if isinstance(t, str) and t.strip():
-                            return t
+                            parts.append(t)
+            if parts:
+                return "\n".join(parts).strip()
     except Exception:
         pass
-
-    # Fallback string
-    try:
-        s = str(resp)
-        return s if s else ""
-    except Exception:
-        return ""
+    return ""
 
 
 # ----------------------------
-# Contract enforcement
+# Contract checks (minimal but strict)
 # ----------------------------
 
-def _contract_check_script(script: Dict[str, Any], expected_chapters: int) -> Tuple[bool, List[str]]:
-    """
-    Validates strict schema and chapter numbering contiguity.
-    Expected structure:
-      {
-        "title": "...",
-        "intro": "...",
-        "chapters": [{"n": 1, "title": "...", "text": "..."}, ...],
-        "outro": "..."
-      }
-    """
+def _validate_script_json(script: Any, expected_chapters: int) -> Tuple[bool, List[str]]:
     problems: List[str] = []
 
     if not isinstance(script, dict):
-        return False, ["script_json_not_a_dict"]
+        return False, ["script_not_object"]
 
+    intro = script.get("intro")
+    outro = script.get("outro")
     chapters = script.get("chapters")
+
+    if not isinstance(intro, str) or not intro.strip():
+        problems.append("intro_missing_or_empty")
+    if not isinstance(outro, str) or not outro.strip():
+        problems.append("outro_missing_or_empty")
+
     if not isinstance(chapters, list):
         problems.append("chapters_missing_or_not_list")
-        chapters = []
+        return False, problems
 
-    # Count check
-    if expected_chapters and len(chapters) != expected_chapters:
+    if len(chapters) != expected_chapters:
         problems.append(f"chapter_count_mismatch_expected_{expected_chapters}_got_{len(chapters)}")
 
-    # Numbering check (must be 1..N contiguous)
     nums: List[int] = []
-    for ch in chapters:
+    for i, ch in enumerate(chapters, start=1):
         if not isinstance(ch, dict):
+            problems.append(f"chapter_{i}_not_object")
             continue
         n = ch.get("n")
         try:
-            n_int = int(n)
-            nums.append(n_int)
+            nums.append(int(n))
         except Exception:
-            continue
-
-    if expected_chapters:
-        wanted = list(range(1, expected_chapters + 1))
-        if nums != wanted:
-            problems.append("chapter_numbers_not_contiguous_from_1")
-
-    # Basic required fields
-    if not isinstance(script.get("intro", ""), str):
-        problems.append("intro_missing_or_not_string")
-    if not isinstance(script.get("outro", ""), str):
-        problems.append("outro_missing_or_not_string")
-
-    # Each chapter must have title/text
-    for i, ch in enumerate(chapters, start=1):
-        if not isinstance(ch, dict):
-            problems.append(f"chapter_{i}_not_an_object")
-            continue
-        if not isinstance(ch.get("title", ""), str) or not ch.get("title", "").strip():
+            problems.append(f"chapter_{i}_missing_or_bad_n")
+        if not isinstance(ch.get("title"), str) or not ch.get("title", "").strip():
             problems.append(f"chapter_{i}_missing_title")
-        if not isinstance(ch.get("text", ""), str) or not ch.get("text", "").strip():
+        if not isinstance(ch.get("text"), str) or not ch.get("text", "").strip():
             problems.append(f"chapter_{i}_missing_text")
+
+    if nums:
+        expected_nums = list(range(1, len(chapters) + 1))
+        if nums != expected_nums:
+            problems.append("chapter_numbers_not_contiguous_from_1")
 
     ok = len(problems) == 0
     return ok, problems
 
 
 # ----------------------------
-# Strict script generator (IMPORTANT: keyword-only args)
+# OpenAI call (Responses API)
 # ----------------------------
 
-def generate_script_strict(
+def _call_openai_json_only(*, model: str, system: str, user: str, temperature: float = 0.2) -> Dict[str, Any]:
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=temperature,
+    )
+
+    # Prefer parsed if available
+    parsed = getattr(resp, "output_parsed", None)
+    if isinstance(parsed, dict):
+        return parsed
+
+    txt = _resp_text(resp)
+    obj = _extract_json_object(txt)
+    if not isinstance(obj, dict):
+        raise ValueError("Model did not return valid JSON object.")
+    return obj
+
+
+# ----------------------------
+# Internal strict generator (keyword-only)
+# ----------------------------
+
+def _generate_script_strict_impl(
     *,
-    client: Any,
-    model: str,
-    outline: str,
     topic: str,
+    outline: str,
+    chapter_count: int,
+    model: str,
+    target_runtime_min: int,
     scope: str,
     constraints: str,
-    target_runtime_min: int,
-    chapter_count: int,
-    max_retries: int = 3,
+    max_passes: int,
 ) -> Tuple[bool, str, Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Returns:
-      ok, message, script_json (or None), enforcement_log (list of passes)
+    Returns: ok, msg, script_json, enforcement_log
     """
-    enforcement_log: List[Dict[str, Any]] = []
-
-    # Guardrails
+    log: List[Dict[str, Any]] = []
     chapter_count = int(chapter_count or 0)
     if chapter_count <= 0:
-        return False, "Chapter count must be >= 1 before generating a strict script.", None, enforcement_log
+        return False, "chapter_count must be >= 1", None, log
 
-    prompt = f"""
-You are generating a STRICT documentary script as JSON ONLY.
+    system = (
+        "You MUST output ONLY valid JSON. No markdown. No commentary.\n"
+        "Follow the INVESTIGATIVE CONTRACT: no novelization, no invented dialogue, no mind-reading.\n"
+        "After Key Players section (in intro), use last names only.\n"
+    )
 
-TOPIC:
-{topic}
+    user_base = {
+        "task": "generate_strict_documentary_script",
+        "topic": topic,
+        "target_runtime_min": int(target_runtime_min),
+        "scope": scope,
+        "constraints": constraints,
+        "chapter_count": chapter_count,
+        "outline": outline,
+        "required_format": {
+            "title": "string",
+            "intro": "string",
+            "chapters": [
+                {"n": "int 1..N contiguous", "title": "string", "text": "string"}
+            ],
+            "outro": "string",
+        },
+        "hard_rules": [
+            f"chapters MUST be EXACTLY {chapter_count} items",
+            "chapter numbers MUST be contiguous starting at 1",
+            "OUTPUT JSON ONLY",
+        ],
+    }
 
-SCOPE:
-{scope}
+    problems: List[str] = []
+    last: Optional[Dict[str, Any]] = None
 
-CONSTRAINTS:
-{constraints}
+    for p in range(1, max_passes + 1):
+        payload = dict(user_base)
+        payload["repair_pass"] = p
+        payload["prior_problems"] = problems
 
-TARGET RUNTIME (min):
-{int(target_runtime_min)}
-
-OUTLINE (do not repeat; follow it):
-{outline}
-
-OUTPUT MUST BE VALID JSON OBJECT with EXACT keys:
-"title" (string),
-"intro" (string),
-"chapters" (array of objects),
-"outro" (string)
-
-Each chapter object MUST be:
-{{"n": <int 1..{chapter_count}>, "title": <string>, "text": <string>}}
-
-Chapters MUST be contiguous 1..{chapter_count}. No skipping.
-Return JSON ONLY. No markdown. No commentary.
-""".strip()
-
-    for attempt in range(1, max_retries + 1):
         try:
-            resp = client.responses.create(
+            script_json = _call_openai_json_only(
                 model=model,
-                input=prompt,
-                # If your SDK/model supports it, this helps enforce JSON:
-                # response_format={"type": "json_object"},
+                system=system,
+                user=json.dumps(payload, ensure_ascii=False),
+                temperature=0.2 if p == 1 else 0.1,
             )
+            ok_render, problems = _validate_script_json(script_json, chapter_count)
+            log.append({"pass": p, "ok_json": True, "ok_render": ok_render, "problems": problems[:]})
+            last = script_json
+            if ok_render:
+                return True, "Script generated (strict).", script_json, log
         except Exception as e:
-            return False, f"OpenAI call failed: {e}", None, enforcement_log
+            problems = ["render_skipped_due_to_json_invalid", f"json_error_{type(e).__name__}"]
+            log.append({"pass": p, "ok_json": False, "ok_render": False, "problems": problems[:]})
+            last = None
 
-        # Try parsed first (some SDKs provide it)
-        parsed = None
-        if hasattr(resp, "output_parsed") and isinstance(getattr(resp, "output_parsed"), dict):
-            parsed = getattr(resp, "output_parsed")
-
-        if parsed is None:
-            txt = _response_text(resp)
-            parsed = _extract_json_object(txt)
-
-        ok_json = isinstance(parsed, dict)
-        ok_contract, problems = (False, ["render_skipped_due_to_json_invalid"])
-        if ok_json:
-            ok_contract, problems = _contract_check_script(parsed, expected_chapters=chapter_count)
-
-        enforcement_log.append(
-            {
-                "pass": attempt,
-                "ok_json": bool(ok_json),
-                "ok_render": bool(ok_contract),
-                "problems": problems,
-            }
-        )
-
-        if ok_json and ok_contract:
-            return True, "OK", parsed, enforcement_log
-
-    # failed all retries
-    return False, "Script blocked by contract enforcement. Fix outline/title and retry.", None, enforcement_log
+    return False, "Script blocked by contract enforcement. Fix outline/title and retry.", last, log
 
 
 # ----------------------------
-# Section extraction for the editable review panel
-# (IMPORTANT: No decorators that CALL generate_script_strict())
+# PUBLIC wrapper (NO-ARG) — this fixes your TypeError
+# Your UI calls: ok, msg = generate_script_strict()
 # ----------------------------
 
-def section_texts() -> List[Tuple[str, str]]:
+def generate_script_strict() -> Tuple[bool, str]:
     """
-    Pulls Intro/Chapters/Outro text from session_state safely.
-    Does NOT call any generators.
+    UI-safe wrapper that reads session_state and writes results back.
+    This function takes NO arguments (matches your current call site).
     """
-    out: List[Tuple[str, str]] = []
-    out.append(("00_intro", (st.session_state.get("intro_text") or "").strip()))
+    # Source of truth
+    topic = (st.session_state.get("episode_title") or "").strip() or "Untitled Episode"
+    outline = (st.session_state.get("OUTLINE_TEXT_SRC") or st.session_state.get("OUTLINE_TEXT_UI") or "").strip()
 
-    n = int(st.session_state.get("chapter_count", 0) or 0)
-    for i in range(1, n + 1):
-        key = f"chapter_{i}_text"
-        out.append((f"{i:02d}_chapter_{i}", (st.session_state.get(key) or "").strip()))
+    # Chapter count: use DEFAULT_CHAPTERS (your UI) as canonical
+    chapter_count = int(st.session_state.get("DEFAULT_CHAPTERS", 8) or 8)
 
-    out.append(("99_outro", (st.session_state.get("outro_text") or "").strip()))
-    return out
+    model = st.session_state.get("SCRIPT_MODEL", st.session_state.get("SCRIPT_MODEL", "gpt-4o-mini"))
+    target_runtime_min = int(st.session_state.get("target_runtime_min", 45) or 45)
+    scope = (st.session_state.get("scope") or "serious, historically grounded investigation").strip()
+    constraints = (st.session_state.get("constraints") or "").strip()
+    max_passes = int(st.session_state.get("script_max_passes", 3) or 3)
 
+    st.session_state["script_generation_log"] = []
 
+    if not outline:
+        return False, "Outline is empty. Generate or paste an outline first."
+
+    ok, msg, script_json, log = _generate_script_strict_impl(
+        topic=topic,
+        outline=outline,
+        chapter_count=chapter_count,
+        model=model,
+        target_runtime_min=target_runtime_min,
+        scope=scope,
+        constraints=constraints,
+        max_passes=max_passes,
+    )
+
+    st.session_state["script_generation_log"] = log
+
+    if not ok or not isinstance(script_json, dict):
+        st.session_state["MASTER_SCRIPT_TEXT"] = ""
+        st.session_state["chapter_count"] = 0
+        reset_script_text_fields(0)
+        return False, msg
+
+    # Render to your existing INTRO/CHAPTER/OUTRO headings so Part 1 parsers work
+    title_line = (script_json.get("title") or topic).strip()
+    intro = (script_json.get("intro") or "").strip()
+    outro = (script_json.get("outro") or "").strip()
+    chapters = script_json.get("chapters") or []
+
+    lines: List[str] = []
+    lines.append("INTRO")
+    lines.append(intro)
+    lines.append("")
+
+    for ch in chapters:
+        n = int(ch.get("n"))
+        t = (ch.get("title") or f"Chapter {n}").strip()
+        tx = (ch.get("text") or "").strip()
+        lines.append(f"CHAPTER {n}: {t}")
+        lines.append(tx)
+        lines.append("")
+
+    lines.append("OUTRO")
+    lines.append(outro)
+    master_text = "\n".join(lines).strip() + "\n"
+
+    st.session_state["MASTER_SCRIPT_TEXT"] = master_text
+
+    # Fill editable fields using your Part 1 parser utilities
+    st.session_state["chapter_count"] = chapter_count
+    reset_script_text_fields(chapter_count)
+
+    parsed = parse_master_script(master_text, chapter_count)
+    st.session_state[text_key("intro", 0)] = (parsed.get("intro", "") or "").strip()
+    for i in range(1, chapter_count + 1):
+        st.session_state[text_key("chapter", i)] = (parsed.get("chapters", {}).get(i, "") or "").strip()
+    st.session_state[text_key("outro", 0)] = (parsed.get("outro", "") or "").strip()
+
+    return True, msg
 
 # ============================
 # PART 3/4 — Outline UI → Generate Strict Script → Editable Review (Single Pipeline)
