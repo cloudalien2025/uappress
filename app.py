@@ -322,7 +322,8 @@ with right:
     )
 
 # ============================
-# PART 3/4 — Audio Generation Pipeline (Sequential, Crash-Safe) — FIXED
+# PART 3/4 — Audio Generation Pipeline (Sequential, Crash-Safe) — FIXED (TTS)
+# Replace your entire Part 3 block with this.
 # ============================
 
 def _require_api_key(api_key: str) -> bool:
@@ -333,10 +334,6 @@ def _require_api_key(api_key: str) -> bool:
 
 
 def _collect_sections() -> List[Tuple[str, str]]:
-    """
-    Returns list of (filename_base, text) for non-empty sections.
-    Filenames will be finalized in MP3 creation.
-    """
     sections: List[Tuple[str, str]] = []
 
     intro = (st.session_state.intro_text or "").strip()
@@ -355,23 +352,63 @@ def _collect_sections() -> List[Tuple[str, str]]:
     return sections
 
 
+def _read_audio_response(resp) -> bytes:
+    """
+    SDK-safe: different OpenAI SDK versions return different response objects.
+    """
+    if resp is None:
+        raise RuntimeError("Empty response from TTS API")
+
+    # Newer SDK often provides .read()
+    if hasattr(resp, "read") and callable(getattr(resp, "read")):
+        b = resp.read()
+        if isinstance(b, (bytes, bytearray)):
+            return bytes(b)
+
+    # Some SDKs expose .content
+    if hasattr(resp, "content"):
+        b = getattr(resp, "content")
+        if isinstance(b, (bytes, bytearray)):
+            return bytes(b)
+
+    # Some SDKs might already return bytes
+    if isinstance(resp, (bytes, bytearray)):
+        return bytes(resp)
+
+    # Fallback: try bytes() coercion
+    try:
+        return bytes(resp)
+    except Exception:
+        raise RuntimeError(f"Unrecognized TTS response type: {type(resp)}")
+
+
 def _openai_tts_mp3_bytes(*, client: OpenAI, model: str, voice: str, text: str) -> bytes:
     """
-    Generates MP3 bytes from OpenAI TTS. Reads text exactly as provided.
+    Generates MP3 bytes from OpenAI TTS.
+    FIX: Use SDK-safe parameter handling (response_format vs format).
+    Reads text exactly as provided.
     """
-    resp = client.audio.speech.create(
-        model=model,
-        voice=voice,
-        input=text,
-        format="mp3",
-    )
-    return resp.read()
+    # Try the most common/current parameter name first:
+    try:
+        resp = client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=text,
+            response_format="mp3",
+        )
+        return _read_audio_response(resp)
+    except TypeError:
+        # Older/newer SDK mismatch: try 'format'
+        resp = client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=text,
+            format="mp3",
+        )
+        return _read_audio_response(resp)
 
 
 def _run_ffmpeg(cmd: List[str]) -> Tuple[int, str]:
-    """
-    Run ffmpeg with captured output for logging.
-    """
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         return p.returncode, p.stdout or ""
@@ -380,9 +417,6 @@ def _run_ffmpeg(cmd: List[str]) -> Tuple[int, str]:
 
 
 def _apply_padding_mp3(mp3_in: str, mp3_out: str, padding_ms: int) -> Tuple[bool, str]:
-    """
-    Adds silence at start and end by concatenating silence + audio + silence.
-    """
     if padding_ms <= 0:
         try:
             with open(mp3_in, "rb") as f_in, open(mp3_out, "wb") as f_out:
@@ -504,6 +538,7 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
         for i, (base_name, text) in enumerate(sections, start=1):
             status.write(f"Generating {base_name}… ({i}/{len(sections)})")
 
+            # 1) TTS -> mp3
             try:
                 raw_mp3 = _openai_tts_mp3_bytes(
                     client=client,
@@ -512,7 +547,7 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
                     text=text,
                 )
             except Exception as e:
-                log_lines.append(f"[ERROR] {base_name}: OpenAI TTS failed: {e}")
+                log_lines.append(f"[ERROR] {base_name}: OpenAI TTS failed: {repr(e)}")
                 st.session_state.last_build_log = "\n".join(log_lines)
                 progress.empty()
                 status.empty()
@@ -523,6 +558,7 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
             with open(raw_path, "wb") as f:
                 f.write(raw_mp3)
 
+            # 2) Padding (optional)
             padded_path = os.path.join(td, f"{base_name}_padded.mp3")
             ok, out = _apply_padding_mp3(raw_path, padded_path, opts.padding_ms)
             if not ok:
@@ -533,6 +569,7 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
                 st.error(f"Padding failed on {base_name}. See log.")
                 return
 
+            # 3) Gain and/or music mix
             final_path = os.path.join(td, f"{base_name}.mp3")
             if opts.add_music and music_path is not None:
                 ok, out = _gain_and_mix_music(
@@ -566,11 +603,12 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
                     st.error(f"Audio processing failed on {base_name}. See log.")
                     return
 
+            # 4) Read final bytes into memory for downloads
             try:
                 with open(final_path, "rb") as f:
                     final_bytes = f.read()
             except Exception as e:
-                log_lines.append(f"[ERROR] {base_name}: could not read output mp3: {e}")
+                log_lines.append(f"[ERROR] {base_name}: could not read output mp3: {repr(e)}")
                 st.session_state.last_build_log = "\n".join(log_lines)
                 progress.empty()
                 status.empty()
