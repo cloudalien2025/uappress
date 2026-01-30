@@ -596,8 +596,7 @@ if st.session_state.get("create_audio_btn"):
     _build_all_mp3s(opts)
 
 # ============================
-# PART 4/4 — Downloads + Packaging (ZIP) + Script Backup Export
-# (append below Part 3 in app.py)
+# PART 4/4 — Downloads + Packaging (ZIP) + Script Backup Export — FIXED
 # ============================
 
 def _zip_bytes(file_map: Dict[str, bytes]) -> bytes:
@@ -629,8 +628,6 @@ def _export_scripts_zip() -> bytes:
     return _zip_bytes(file_map)
 
 
-# --- UI: show generated files + downloads in the right column area
-# (We can render in-place; Streamlit columns persist across reruns.)
 st.markdown("---")
 st.subheader("Outputs")
 
@@ -641,7 +638,6 @@ if not generated:
 else:
     st.caption("Download individual MP3s or download everything as a ZIP.")
 
-    # Individual downloads
     for fname, b in generated.items():
         st.download_button(
             label=f"Download {fname}",
@@ -652,9 +648,10 @@ else:
             key=f"dl_{fname}",
         )
 
-# ZIP download button (wired to the button in Part 2)
+
+# ZIP download trigger
+# IMPORTANT: Do NOT assign to st.session_state.download_zip_btn (widget-owned key).
 if st.session_state.get("download_zip_btn"):
-    st.session_state.download_zip_btn = False
     if not generated:
         st.warning("No MP3s to zip yet. Click **Create Audio** first.")
     else:
@@ -669,9 +666,10 @@ if st.session_state.get("download_zip_btn"):
             key="dl_all_zip_now",
         )
 
-# Script export button
+
+# Script export trigger
+# IMPORTANT: Do NOT assign to st.session_state.export_scripts_btn (widget-owned key).
 if st.session_state.get("export_scripts_btn"):
-    st.session_state.export_scripts_btn = False
     zip_b = _export_scripts_zip()
     proj_slug = _slugify(st.session_state.project_title)
     st.download_button(
@@ -682,3 +680,4 @@ if st.session_state.get("export_scripts_btn"):
         use_container_width=True,
         key="dl_scripts_zip_now",
     )
+
