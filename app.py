@@ -480,54 +480,51 @@ def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, o
     }
 
 # ============================
-# PART 2/4 — OpenAI Script Generator + TTS Engine + FFmpeg Audio Ops + Cache + ZIP Helpers (FIXED)
+# PART 2/4 — OpenAI Script Generator (SUPER PROMPT) + TTS Engine + FFmpeg Audio Ops + Cache + ZIP Helpers — FIXED
 # ============================
-# Drop this block BETWEEN Part 1 and Part 3.
-#
-# Fixes included:
-# ✅ Defines generate_master_script_one_shot (your Part 3 calls this)
-# ✅ Defines get_media_duration_seconds (your Part 4 expects this)
-# ✅ Provides TTSConfig + caching + chunking + tts_to_wav
-# ✅ Keeps your SUPER_ROLE_PROMPT + SUPER_SCRIPT_CONTRACT usage
-# ✅ Robust ffmpeg concat list escaping
-# ✅ make_zip_bytes helper
-#
-# NOTE: This part assumes Part 1 already defined:
-# - client (OpenAI)
-# - st, os, re, io, time, zipfile, tempfile, hashlib, dataclass, List, Tuple, Optional
-# - FFMPEG, run_ffmpeg, run_cmd
-# - sanitize_for_tts, clean_filename, text_key
-#
-# ============================
+# FIXES INCLUDED:
+# ✅ Contract enforcement moved INTO the USER prompt (closest instruction to generation)
+# ✅ Outline treated as PLANNING ONLY (explicitly “do not narrate the outline”)
+# ✅ Lower default temperature for reduced drift (0.25)
+# ✅ Retry pass gets even stricter + lower temp (0.15)
+# ✅ Keeps SUPER_ROLE_PROMPT as system (style only)
+# ✅ Function signature unchanged: generate_master_script_one_shot(topic, master_prompt, chapters, model, ...)
 
 # ----------------------------
-# Script generation (Outline/Treatment -> Full Script)
+# Script generation (SUPER MASTER PROMPT v3.1 — STRICT template master script)
 # ----------------------------
-def _build_generation_prompt(*, topic: str, master_prompt: str, chapters: int) -> str:
+def _build_generation_prompt(*, topic: str, outline: str, chapters: int) -> str:
     """
-    Builds the USER prompt. System behavior is controlled by:
-      - SUPER_ROLE_PROMPT
-      - SUPER_SCRIPT_CONTRACT
-
-    IMPORTANT:
-    - master_prompt can be your outline/treatment text
-    - Keep plain text (no markdown)
+    Builds the USER message (plain text, no markdown).
+    We intentionally embed SUPER_SCRIPT_CONTRACT here to keep it closest to the model output.
     """
     topic = (topic or "").strip()
-    master_prompt = (master_prompt or "").strip()
+    outline = (outline or "").strip()
     chapters = max(3, int(chapters or 0))
 
     return f"""
-DOCUMENTARY TITLE:
+YOU MUST FOLLOW THIS OUTPUT CONTRACT EXACTLY:
+{SUPER_SCRIPT_CONTRACT}
+
+TOPIC:
 {topic}
 
 CHAPTER COUNT:
 {chapters}
 
-OUTLINE / TREATMENT (DO NOT NARRATE THIS AS META):
-{master_prompt}
+OUTLINE (PLANNING ONLY — DO NOT NARRATE OR RESTATE THIS OUTLINE):
+{outline}
 
-FINAL INSTRUCTION:
+HARD ENFORCEMENT (NON-NEGOTIABLE):
+- Every paragraph must include a human pressure point (decision, risk, constraint, consequence).
+- No “context dump” paragraphs. No broad explainers about Cold War, nukes, etc. unless tied to an immediate decision or constraint.
+- Write scenes as procedures under stress: who did what, what they chose, what they documented, what they hesitated to report.
+- Use LAST NAMES ONLY after the Key Players section in INTRO.
+- STRICT CONTINUITY: each chapter begins exactly where the previous ends. No recaps.
+- No meta language: no “in this chapter”, no “we will”, no “next”.
+- Return ONLY the script text in the required headings.
+
+FINAL COMMAND:
 Generate the complete long-form investigative documentary script now.
 Return ONLY the script text in the strict template required by the contract.
 """.strip()
@@ -536,32 +533,36 @@ Return ONLY the script text in the strict template required by the contract.
 def generate_master_script_one_shot(
     *,
     topic: str,
-    master_prompt: str,
+    master_prompt: str,   # keep name for compatibility with Part 3 (this is the outline)
     chapters: int,
     model: str,
-    temperature: float = 0.55,
+    temperature: float = 0.25,
     tries: int = 2,
 ) -> str:
     """
-    One-shot generation:
-      - Uses SUPER_ROLE_PROMPT + SUPER_SCRIPT_CONTRACT as system messages
-      - Forces strict template (INTRO / CHAPTER N / OUTRO)
-      - Returns raw text (to be parsed by parse_master_script in Part 1)
+    One-shot generation with strict enforcement.
+    - System: SUPER_ROLE_PROMPT (style)
+    - User: SUPER_SCRIPT_CONTRACT + outline + hard enforcement
+
+    Retries once with even stricter reminder + lower temperature.
     """
     chapters = max(3, int(chapters or 0))
-    user_prompt = _build_generation_prompt(topic=topic, master_prompt=master_prompt, chapters=chapters)
+    user_prompt = _build_generation_prompt(topic=topic, outline=master_prompt, chapters=chapters)
 
     last_err: Optional[Exception] = None
+
     for attempt in range(max(1, int(tries or 1))):
         try:
+            # Tighten temperature on retry
+            t = temperature if attempt == 0 else 0.15
+
             r = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": SUPER_ROLE_PROMPT},
-                    {"role": "system", "content": SUPER_SCRIPT_CONTRACT},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=temperature if attempt == 0 else max(0.2, float(temperature) - 0.25),
+                temperature=t,
             )
 
             txt = (r.choices[0].message.content or "").strip()
@@ -573,24 +574,37 @@ def generate_master_script_one_shot(
             if "CHAPTER" not in u:
                 raise ValueError("Model output missing CHAPTER headings.")
 
-            # Reject common drift modes
-            banned = [
+            # Hard fail on common drift markers
+            bad_markers = [
                 "HIGH-LEVEL ASSESSMENT",
                 "FINAL VERDICT",
                 "WHAT WORKS",
                 "PROPOSED IMPROVEMENTS",
-                "SUMMARY:",
-                "CONCLUSION:",
+                "TABLE OF CONTENTS",
+                "SUMMARY",
+                "IN THIS CHAPTER",
+                "IN THE NEXT CHAPTER",
+                "WE WILL",
+                "WE'RE GOING TO",
             ]
-            if attempt == 0 and any(b in u for b in banned):
-                raise ValueError("Model output included editorial sections (not allowed).")
+            if any(b in u for b in bad_markers):
+                raise ValueError("Model output included forbidden meta/editorial sections.")
 
             return txt
 
         except Exception as e:
             last_err = e
             time.sleep(0.6)
-            user_prompt += "\n\nSTRICT REMINDER: Output ONLY the required template headings + narration text. No commentary."
+
+            # Retry prompt: even stricter, explicitly bans “context dump”
+            user_prompt = user_prompt + """
+
+STRICT RETRY (MANDATORY):
+- NO context dump paragraphs.
+- EVERY paragraph must contain an immediate decision/action/risk/consequence.
+- If you start explaining history, you MUST tie it to a person making a procedural choice in that moment.
+- Output ONLY: INTRO / CHAPTER N: Title / OUTRO with narration text.
+"""
             continue
 
     raise RuntimeError(f"Script generation failed: {last_err}")
@@ -603,12 +617,12 @@ def generate_master_script_one_shot(
 class TTSConfig:
     model: str
     voice: str
-    speed: float = 1.0  # reserved (not applied)
+    speed: float = 1.0  # reserved
     enable_cache: bool = True
     cache_dir: str = ".uappress_tts_cache"
 
 
-def _ensure_dir2(p: str) -> None:
+def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
@@ -617,8 +631,9 @@ def _sha1(s: str) -> str:
 
 
 def _tts_cache_path(cfg: TTSConfig, text: str) -> str:
+    # Cache key includes model + voice + text. (Speed reserved but not applied yet.)
     key = _sha1(f"model={cfg.model}|voice={cfg.voice}|text={text}")
-    _ensure_dir2(cfg.cache_dir)
+    _ensure_dir(cfg.cache_dir)
     return os.path.join(cfg.cache_dir, f"tts_{key}.wav")
 
 
@@ -668,41 +683,17 @@ def strip_tts_directives(text: str) -> str:
 
 
 # ----------------------------
-# Media duration (for Part 4 UI)
-# ----------------------------
-def get_media_duration_seconds(path: str) -> float:
-    """
-    Uses ffmpeg stderr Duration line. Works on mp3/wav/m4a/mp4.
-    """
-    try:
-        _, _, err = run_cmd([FFMPEG, "-i", path])
-        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
-        if not m:
-            return 0.0
-        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-    except Exception:
-        return 0.0
-
-
-# ----------------------------
 # FFmpeg audio ops
 # ----------------------------
-def _ff_concat_list_escape(p: str) -> str:
-    # ffmpeg concat list uses single quotes; escape single quote safely
-    return (p or "").replace("'", r"'\''")
-
-
 def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
-    """
-    Concatenate WAVs via concat demuxer (stream copy).
-    REQUIREMENT: WAV formats must match. (Part 4 enforces unified WAV.)
-    """
+    """Concatenate WAVs via concat demuxer (stream copy)."""
     if not wav_paths:
         raise ValueError("concat_wavs: wav_paths is empty")
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for wp in wav_paths:
-            f.write(f"file '{_ff_concat_list_escape(wp)}'\n")
+            escaped = wp.replace("'", "'\\''")
+            f.write(f"file '{escaped}'\n")
         list_path = f.name
 
     try:
@@ -718,6 +709,14 @@ def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
     run_ffmpeg([FFMPEG, "-y", "-i", wav_path, "-c:a", "libmp3lame", "-b:a", bitrate, mp3_path])
 
 
+def get_audio_duration_seconds(path: str) -> float:
+    _, _, err = run_cmd([FFMPEG, "-i", path])
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
+    if not m:
+        return 0.0
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+
 def mix_music_under_voice(
     voice_wav: str,
     music_path: str,
@@ -729,13 +728,13 @@ def mix_music_under_voice(
     Loop music bed under voice, fade in/out, then loudnorm.
     Output WAV for later MP3 encoding.
     """
-    dur = max(0.0, float(get_media_duration_seconds(voice_wav)))
-    fade_out_start = max(0.0, dur - float(fade_s))
+    dur = max(0.0, get_audio_duration_seconds(voice_wav))
+    fade_out_start = max(0.0, dur - fade_s)
 
     filter_complex = (
-        f"[1:a]volume={int(music_db)}dB,"
-        f"afade=t=in:st=0:d={int(fade_s)},"
-        f"afade=t=out:st={fade_out_start}:d={int(fade_s)}[m];"
+        f"[1:a]volume={music_db}dB,"
+        f"afade=t=in:st=0:d={fade_s},"
+        f"afade=t=out:st={fade_out_start}:d={fade_s}[m];"
         f"[0:a][m]amix=inputs=2:duration=first:dropout_transition=2,"
         f"loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
     )
@@ -791,7 +790,7 @@ def tts_to_wav(*, text: str, out_wav: str, cfg: TTSConfig) -> None:
 
             if cfg.enable_cache and cache_path:
                 try:
-                    _ensure_dir2(cfg.cache_dir)
+                    _ensure_dir(cfg.cache_dir)
                     with open(cache_path, "wb") as f2, open(part_path, "rb") as f1:
                         f2.write(f1.read())
                     wav_parts.append(cache_path)
