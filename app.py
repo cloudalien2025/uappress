@@ -953,6 +953,66 @@ if gen_script:
 
             st.success(f"Script generated: Intro + {n} chapters + Outro")
 
+# ----------------------------
+# Script review & edit (YOU WERE MISSING THIS)
+# ----------------------------
+st.header("2️⃣ Script Review (Editable)")
+
+# Intro
+st.subheader("INTRO")
+st.text_area(
+    "Intro narration",
+    key=text_key("intro", 0),
+    height=240,
+)
+
+st.divider()
+
+# Chapters
+chapter_count = int(st.session_state.get("chapter_count", 0))
+if chapter_count > 0:
+    for i in range(1, chapter_count + 1):
+        with st.expander(f"CHAPTER {i}", expanded=(i == 1)):
+            st.text_area(
+                f"Chapter {i} narration",
+                key=text_key("chapter", i),
+                height=340,
+            )
+else:
+    st.info("No chapters loaded yet.")
+
+st.divider()
+
+# Outro
+st.subheader("OUTRO")
+st.text_area(
+    "Outro narration",
+    key=text_key("outro", 0),
+    height=240,
+)
+
+# ----------------------------
+# Reset controls
+# ----------------------------
+st.divider()
+c1, c2, c3 = st.columns([1, 1, 2])
+
+with c1:
+    if st.button("Clear Script"):
+        reset_script_text_fields(st.session_state.get("chapter_count", 0))
+        st.session_state["chapter_count"] = 0
+        st.session_state["MASTER_SCRIPT_TEXT"] = ""
+        st.success("Script cleared.")
+
+with c2:
+    if st.button("Clear Outline"):
+        st.session_state["OUTLINE_TEXT_SRC"] = ""
+        st.session_state["_PENDING_OUTLINE_SYNC"] = True
+        st.rerun()
+
+with c3:
+    st.caption("Clearing text does not affect any already-generated audio.")
+        
         except Exception as e:
             st.error(str(e))
             
