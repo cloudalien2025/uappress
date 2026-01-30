@@ -322,8 +322,7 @@ with right:
     )
 
 # ============================
-# PART 3/4 — Audio Generation Pipeline (Sequential, Crash-Safe)
-# (append below Part 2 in app.py)
+# PART 3/4 — Audio Generation Pipeline (Sequential, Crash-Safe) — FIXED
 # ============================
 
 def _require_api_key(api_key: str) -> bool:
@@ -360,8 +359,6 @@ def _openai_tts_mp3_bytes(*, client: OpenAI, model: str, voice: str, text: str) 
     """
     Generates MP3 bytes from OpenAI TTS. Reads text exactly as provided.
     """
-    # The OpenAI Python SDK supports audio.speech.create for TTS in modern versions.
-    # If your SDK differs, adjust only this function.
     resp = client.audio.speech.create(
         model=model,
         voice=voice,
@@ -384,11 +381,9 @@ def _run_ffmpeg(cmd: List[str]) -> Tuple[int, str]:
 
 def _apply_padding_mp3(mp3_in: str, mp3_out: str, padding_ms: int) -> Tuple[bool, str]:
     """
-    Adds silence at start and end using ffmpeg 'adelay' and 'apad/atrim' style padding.
-    For simplicity: we prepend delay and append silence via 'apad' then trim to original+padding.
+    Adds silence at start and end by concatenating silence + audio + silence.
     """
     if padding_ms <= 0:
-        # just copy
         try:
             with open(mp3_in, "rb") as f_in, open(mp3_out, "wb") as f_out:
                 f_out.write(f_in.read())
@@ -396,8 +391,6 @@ def _apply_padding_mp3(mp3_in: str, mp3_out: str, padding_ms: int) -> Tuple[bool
         except Exception as e:
             return False, str(e)
 
-    # Create: start delay via adelay, then apad to ensure tail exists, then atrim by duration is tricky.
-    # Easiest reliable: concat silence + audio + silence.
     ffmpeg = _ffmpeg_path()
     pad_s = padding_ms / 1000.0
 
@@ -425,19 +418,12 @@ def _gain_and_mix_music(
     loop_music: bool,
     bitrate: str,
 ) -> Tuple[bool, str]:
-    """
-    Mixes narration with music using ffmpeg. Loops music if requested.
-    """
     ffmpeg = _ffmpeg_path()
 
-    # If loop_music, use -stream_loop -1 for music input.
     music_input = ["-i", music_path]
     if loop_music:
         music_input = ["-stream_loop", "-1", "-i", music_path]
 
-    # Apply gain to speech and volume scalar to music, then mix.
-    # - shortest=1 ends at the shorter stream; but with looping music, speech is shorter, so use shortest=1.
-    # Keep narration dominant: music_volume default 0.18
     cmd = [
         ffmpeg, "-y",
         "-i", speech_mp3,
@@ -464,9 +450,6 @@ def _maybe_gain_only(
     speech_gain_db: float,
     bitrate: str,
 ) -> Tuple[bool, str]:
-    """
-    Apply narration gain without music.
-    """
     if abs(speech_gain_db) < 0.01:
         try:
             with open(speech_mp3, "rb") as f_in, open(out_mp3, "wb") as f_out:
@@ -489,10 +472,6 @@ def _maybe_gain_only(
 
 
 def _build_all_mp3s(opts: AudioOptions) -> None:
-    """
-    Main build: sequentially generate MP3s for each non-empty section.
-    Stores results in st.session_state.generated_files.
-    """
     if not _require_api_key(opts.api_key):
         return
 
@@ -510,7 +489,6 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
     log_lines: List[str] = []
 
     with tempfile.TemporaryDirectory() as td:
-        # If music is on, write the uploaded music to a file once.
         music_path = None
         if opts.add_music:
             if not opts.music_bytes:
@@ -526,7 +504,6 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
         for i, (base_name, text) in enumerate(sections, start=1):
             status.write(f"Generating {base_name}… ({i}/{len(sections)})")
 
-            # 1) TTS -> mp3
             try:
                 raw_mp3 = _openai_tts_mp3_bytes(
                     client=client,
@@ -546,7 +523,6 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
             with open(raw_path, "wb") as f:
                 f.write(raw_mp3)
 
-            # 2) Padding (optional)
             padded_path = os.path.join(td, f"{base_name}_padded.mp3")
             ok, out = _apply_padding_mp3(raw_path, padded_path, opts.padding_ms)
             if not ok:
@@ -557,7 +533,6 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
                 st.error(f"Padding failed on {base_name}. See log.")
                 return
 
-            # 3) Gain and/or music mix
             final_path = os.path.join(td, f"{base_name}.mp3")
             if opts.add_music and music_path is not None:
                 ok, out = _gain_and_mix_music(
@@ -591,7 +566,6 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
                     st.error(f"Audio processing failed on {base_name}. See log.")
                     return
 
-            # 4) Read final bytes into memory for downloads
             try:
                 with open(final_path, "rb") as f:
                     final_bytes = f.read()
@@ -617,9 +591,9 @@ def _build_all_mp3s(opts: AudioOptions) -> None:
 
 
 # Wire the Create Audio button from Part 2
+# IMPORTANT: Do NOT assign to st.session_state.create_audio_btn (widget-owned key).
 if st.session_state.get("create_audio_btn"):
     _build_all_mp3s(opts)
-    st.session_state.create_audio_btn = False  # prevent rerun re-trigger
 
 # ============================
 # PART 4/4 — Downloads + Packaging (ZIP) + Script Backup Export
