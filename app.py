@@ -480,344 +480,565 @@ def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, o
     }
 
 # ============================
-# PART 2/4 — OpenAI Script Generator (SUPER PROMPT) + TTS Engine + FFmpeg Audio Ops + Cache + ZIP Helpers — FIXED
+# PART 2/4 — Script Generation (Contract-Hardened)
 # ============================
-# FIXES INCLUDED:
-# ✅ Contract enforcement moved INTO the USER prompt (closest instruction to generation)
-# ✅ Outline treated as PLANNING ONLY (explicitly “do not narrate the outline”)
-# ✅ Lower default temperature for reduced drift (0.25)
-# ✅ Retry pass gets even stricter + lower temp (0.15)
-# ✅ Keeps SUPER_ROLE_PROMPT as system (style only)
-# ✅ Function signature unchanged: generate_master_script_one_shot(topic, master_prompt, chapters, model, ...)
+# Goal: Prevent fictional drift by forcing structured JSON output + deterministic validators + repair loop.
+# - No novelization, no invented dialogue, no mind-reading
+# - Last-names-only AFTER Key Players
+# - Evidentiary labeling on every paragraph
+# - Procedural pressure only (no cinematic prose)
+#
+# Assumes earlier parts provide:
+# - st, OpenAI client as `client` (or you can instantiate here)
+# - user inputs in st.session_state as needed (topic, scope, runtime, chapter count, etc.)
+# - downstream parts expect `st.session_state["generated_script_text"]` and/or `st.session_state["generated_script_json"]`
+
+import json
+import re
+from typing import Any, Dict, List, Tuple
 
 # ----------------------------
-# Script generation (SUPER MASTER PROMPT v3.1 — STRICT template master script)
+# Contract + Schema
 # ----------------------------
-def _build_generation_prompt(*, topic: str, outline: str, chapters: int) -> str:
-    """
-    Builds the USER message (plain text, no markdown).
-    We intentionally embed SUPER_SCRIPT_CONTRACT here to keep it closest to the model output.
-    """
-    topic = (topic or "").strip()
-    outline = (outline or "").strip()
-    chapters = max(3, int(chapters or 0))
 
-    return f"""
-YOU MUST FOLLOW THIS OUTPUT CONTRACT EXACTLY:
-{SUPER_SCRIPT_CONTRACT}
+EVIDENCE_LABELS = ["FACT", "REPORT", "STATEMENT", "ANALYSIS", "DISPUTED"]
+EVIDENCE_TAG_RE = re.compile(r"^\[(FACT|REPORT|STATEMENT|ANALYSIS|DISPUTED)\]\s+")
 
-TOPIC:
-{topic}
+FORBIDDEN_DIALOGUE_RE = re.compile(
+    r'(".*?"|“.*?”|‘.*?’|\b(he said|she said|they said|I said|we said|told me|told us|replied|shouted|whispered)\b)',
+    re.IGNORECASE | re.DOTALL,
+)
 
-CHAPTER COUNT:
-{chapters}
+FORBIDDEN_MINDREADING_RE = re.compile(
+    r"\b(thought|felt|feels|fear(ed)?|hoped|wanted|knew|realized|remembered|believed|decided|wondered|couldn't help but)\b",
+    re.IGNORECASE,
+)
 
-OUTLINE (PLANNING ONLY — DO NOT NARRATE OR RESTATE THIS OUTLINE):
-{outline}
+FORBIDDEN_NOVELIZATION_RE = re.compile(
+    r"\b(moonlit|moonlight|dusky|eerie|ominous|haunting|chilling|blood[- ]?red|piercing|deafening|silence fell|the air was thick|"
+    r"shadows|glowed|shimmered|echoed|rushed|heartbeat|sweat|trembled|quivered|gasped)\b",
+    re.IGNORECASE,
+)
 
-HARD ENFORCEMENT (NON-NEGOTIABLE):
-- Every paragraph must include a human pressure point (decision, risk, constraint, consequence).
-- No “context dump” paragraphs. No broad explainers about Cold War, nukes, etc. unless tied to an immediate decision or constraint.
-- Write scenes as procedures under stress: who did what, what they chose, what they documented, what they hesitated to report.
-- Use LAST NAMES ONLY after the Key Players section in INTRO.
-- STRICT CONTINUITY: each chapter begins exactly where the previous ends. No recaps.
-- No meta language: no “in this chapter”, no “we will”, no “next”.
-- Return ONLY the script text in the required headings.
+FORBIDDEN_CERTAINTY_RE = re.compile(
+    r"\b(proves|proof that|definitively|without question|no doubt|certainly|undeniable|conclusively)\b",
+    re.IGNORECASE,
+)
 
-FINAL COMMAND:
-Generate the complete long-form investigative documentary script now.
-Return ONLY the script text in the strict template required by the contract.
-""".strip()
+FIRST_NAME_TOKEN_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")  # heuristic; filtered by allowlist later
 
 
-def generate_master_script_one_shot(
-    *,
-    topic: str,
-    master_prompt: str,   # keep name for compatibility with Part 3 (this is the outline)
-    chapters: int,
-    model: str,
-    temperature: float = 0.25,
-    tries: int = 2,
-) -> str:
-    """
-    One-shot generation with strict enforcement.
-    - System: SUPER_ROLE_PROMPT (style)
-    - User: SUPER_SCRIPT_CONTRACT + outline + hard enforcement
+SCRIPT_JSON_SCHEMA: Dict[str, Any] = {
+    "name": "uappress_investigative_script_v1",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["title", "central_question", "key_players", "chapters"],
+        "properties": {
+            "title": {"type": "string", "minLength": 8, "maxLength": 120},
+            "central_question": {"type": "string", "minLength": 12, "maxLength": 220},
+            "key_players": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 25,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["full_name", "last_name", "role", "why_relevant", "source_types"],
+                    "properties": {
+                        "full_name": {"type": "string", "minLength": 3, "maxLength": 80},
+                        "last_name": {"type": "string", "minLength": 2, "maxLength": 40},
+                        "role": {"type": "string", "minLength": 2, "maxLength": 120},
+                        "why_relevant": {"type": "string", "minLength": 10, "maxLength": 260},
+                        "source_types": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 8,
+                            "items": {
+                                "type": "string",
+                                "enum": [
+                                    "Official statement",
+                                    "Contemporaneous press",
+                                    "Court/Legal record",
+                                    "Government document",
+                                    "Academic/Scholarly work",
+                                    "Book (secondary)",
+                                    "Interview/Testimony",
+                                    "FOIA release",
+                                    "Media investigation",
+                                    "Unknown/Unverified",
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+            "chapters": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 20,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["chapter_number", "chapter_title", "start_where_previous_ended", "segments"],
+                    "properties": {
+                        "chapter_number": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "chapter_title": {"type": "string", "minLength": 6, "maxLength": 120},
+                        "start_where_previous_ended": {"type": "string", "minLength": 10, "maxLength": 240},
+                        "segments": {
+                            "type": "array",
+                            "minItems": 6,
+                            "maxItems": 80,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["evidence_label", "text", "source_types"],
+                                "properties": {
+                                    "evidence_label": {"type": "string", "enum": EVIDENCE_LABELS},
+                                    "text": {"type": "string", "minLength": 30, "maxLength": 1200},
+                                    "source_types": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 5,
+                                        "items": {
+                                            "type": "string",
+                                            "enum": [
+                                                "Official statement",
+                                                "Contemporaneous press",
+                                                "Court/Legal record",
+                                                "Government document",
+                                                "Academic/Scholarly work",
+                                                "Book (secondary)",
+                                                "Interview/Testimony",
+                                                "FOIA release",
+                                                "Media investigation",
+                                                "Unknown/Unverified",
+                                            ],
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
 
-    Retries once with even stricter reminder + lower temperature.
-    """
-    chapters = max(3, int(chapters or 0))
-    user_prompt = _build_generation_prompt(topic=topic, outline=master_prompt, chapters=chapters)
+CONTRACT_SYSTEM = """You are UAPpress Documentary TTS Studio — Script Generator.
+You MUST obey the Investigative Documentary Contract below. If any instruction conflicts, the Contract wins.
 
-    last_err: Optional[Exception] = None
-
-    for attempt in range(max(1, int(tries or 1))):
-        try:
-            # Tighten temperature on retry
-            t = temperature if attempt == 0 else 0.15
-
-            r = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SUPER_ROLE_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=t,
-            )
-
-            txt = (r.choices[0].message.content or "").strip()
-            u = txt.upper()
-
-            # Parser-safe sanity checks
-            if "INTRO" not in u or "OUTRO" not in u:
-                raise ValueError("Model output missing INTRO/OUTRO headings.")
-            if "CHAPTER" not in u:
-                raise ValueError("Model output missing CHAPTER headings.")
-
-            # Hard fail on common drift markers
-            bad_markers = [
-                "HIGH-LEVEL ASSESSMENT",
-                "FINAL VERDICT",
-                "WHAT WORKS",
-                "PROPOSED IMPROVEMENTS",
-                "TABLE OF CONTENTS",
-                "SUMMARY",
-                "IN THIS CHAPTER",
-                "IN THE NEXT CHAPTER",
-                "WE WILL",
-                "WE'RE GOING TO",
-            ]
-            if any(b in u for b in bad_markers):
-                raise ValueError("Model output included forbidden meta/editorial sections.")
-
-            return txt
-
-        except Exception as e:
-            last_err = e
-            time.sleep(0.6)
-
-            # Retry prompt: even stricter, explicitly bans “context dump”
-            user_prompt = user_prompt + """
-
-STRICT RETRY (MANDATORY):
-- NO context dump paragraphs.
-- EVERY paragraph must contain an immediate decision/action/risk/consequence.
-- If you start explaining history, you MUST tie it to a person making a procedural choice in that moment.
-- Output ONLY: INTRO / CHAPTER N: Title / OUTRO with narration text.
+INVESTIGATIVE DOCUMENTARY CONTRACT (NON-NEGOTIABLE)
+1) NO NOVELIZATION: Do not write cinematic prose, scene-setting, emotions, sensory detail, or dramatization.
+2) NO INVENTED DIALOGUE: No quotes, no reconstructed conversations, no “he said/she said” paraphrase.
+3) NO MIND-READING: Do not claim what anyone thought, felt, intended, feared, or believed unless explicitly documented, and if documented label it as STATEMENT and attribute neutrally.
+4) EVIDENTIARY LABELING: Every paragraph must be tagged as exactly one of: [FACT], [REPORT], [STATEMENT], [ANALYSIS], [DISPUTED].
+   - FACT: widely corroborated / primary records; REPORT: contemporaneous journalism; STATEMENT: attributed claim/testimony; ANALYSIS: careful reasoning without new facts; DISPUTED: conflicts/uncertainty and why.
+5) LAST-NAMES-ONLY RULE: You may introduce a person in Key Players with full name. After Key Players, refer to any person ONLY by last name.
+6) PROCEDURAL PRESSURE ONLY: Tension comes from timelines, gaps, contradictions, incentives, and institutional process — not from horror/sci-fi tone.
+7) NO OVERCLAIMS: Avoid certainty words like “proves/definitive/undeniable.” Use careful, qualified language.
+8) OUTPUT FORMAT: You MUST output valid JSON that matches the provided JSON Schema. Do not include any non-JSON text.
 """
+
+def _build_user_brief() -> str:
+    topic = (st.session_state.get("topic") or st.session_state.get("case_topic") or "").strip()
+    if not topic:
+        topic = "User-provided case/topic (not specified)"
+    runtime_min = st.session_state.get("target_runtime_min") or st.session_state.get("runtime_min") or 45
+    chapter_count = st.session_state.get("chapter_count") or st.session_state.get("chapters") or 10
+    region = (st.session_state.get("region") or "").strip()
+    scope = (st.session_state.get("scope") or "serious, historically grounded investigation").strip()
+    constraints = (st.session_state.get("constraints") or "").strip()
+
+    brief = {
+        "topic": topic,
+        "scope": scope,
+        "target_runtime_min": int(runtime_min),
+        "chapter_count": int(chapter_count),
+        "region": region,
+        "extra_constraints": constraints,
+        "hard_rules_reminder": {
+            "no_novelization": True,
+            "no_invented_dialogue": True,
+            "no_mind_reading": True,
+            "last_names_only_after_key_players": True,
+            "every_paragraph_labeled": EVIDENCE_LABELS,
+            "procedural_pressure_only": True,
+        },
+        "narration_style": "calm, precise, investigative; no hype; no recap; forward-moving chronology; each chapter starts where previous ends",
+    }
+    return json.dumps(brief, ensure_ascii=False, indent=2)
+
+# ----------------------------
+# Validators (deterministic)
+# ----------------------------
+
+def _collect_key_player_names(script_json: Dict[str, Any]) -> Tuple[set, set]:
+    full_names = set()
+    last_names = set()
+    for kp in script_json.get("key_players", []) or []:
+        fn = (kp.get("full_name") or "").strip()
+        ln = (kp.get("last_name") or "").strip()
+        if fn:
+            full_names.add(fn)
+        if ln:
+            last_names.add(ln)
+    return full_names, last_names
+
+def _text_has_forbidden_patterns(text: str) -> List[str]:
+    hits = []
+    if FORBIDDEN_DIALOGUE_RE.search(text or ""):
+        hits.append("invented_dialogue_or_quotes")
+    if FORBIDDEN_MINDREADING_RE.search(text or ""):
+        hits.append("mind_reading_language")
+    if FORBIDDEN_NOVELIZATION_RE.search(text or ""):
+        hits.append("novelization_cinematic_prose")
+    if FORBIDDEN_CERTAINTY_RE.search(text or ""):
+        hits.append("overclaiming_certainty")
+    return hits
+
+def _find_first_name_mentions_outside_key_players(script_json: Dict[str, Any]) -> List[str]:
+    """
+    After Key Players, only last names allowed. This flags likely first-name mentions
+    by scanning capitalized tokens and filtering out:
+    - evidence labels, common sentence starters, months, acronyms
+    - last names from key players (allowed)
+    """
+    _, allowed_last = _collect_key_player_names(script_json)
+
+    # common allowlist tokens (expand if needed)
+    allow_tokens = {
+        "The", "A", "An", "In", "On", "At", "By", "To", "From", "And", "But", "Or", "For", "With", "Without",
+        "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December",
+        "UAP", "UFO", "US", "USA", "Navy", "Air", "Force", "DoD", "CIA", "NSA", "FBI", "DIA", "AARO", "NASA", "NORAD",
+        "Project", "Operation", "Department", "Committee", "Congress", "Senate", "House",
+    }
+    suspicious: List[str] = []
+
+    for ch in script_json.get("chapters", []) or []:
+        for seg in ch.get("segments", []) or []:
+            txt = seg.get("text") or ""
+            # Collect capitalized tokens
+            tokens = FIRST_NAME_TOKEN_RE.findall(txt)
+            for t in tokens:
+                if t in allow_tokens:
+                    continue
+                if t in allowed_last:
+                    continue
+                # If token appears as evidence label prefix, skip
+                if t in EVIDENCE_LABELS:
+                    continue
+                # Heuristic: If token ends sentence start, we still consider suspicious (can't be sure)
+                # but reduce spam by ignoring tokens following punctuation + space pattern? (Not reliable)
+                suspicious.append(t)
+
+    # De-duplicate, keep stable order
+    seen = set()
+    out = []
+    for t in suspicious:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+def _validate_script_json(script_json: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    problems: List[str] = []
+
+    # Basic structure checks
+    if not isinstance(script_json, dict):
+        return False, ["output_not_json_object"]
+
+    if "key_players" not in script_json or not script_json.get("key_players"):
+        problems.append("missing_key_players")
+
+    if "chapters" not in script_json or not script_json.get("chapters"):
+        problems.append("missing_chapters")
+
+    # Segment-level checks
+    for ch in script_json.get("chapters", []) or []:
+        segments = ch.get("segments", []) or []
+        if not segments:
+            problems.append(f"chapter_{ch.get('chapter_number','?')}_has_no_segments")
             continue
 
-    raise RuntimeError(f"Script generation failed: {last_err}")
+        for seg in segments:
+            label = (seg.get("evidence_label") or "").strip()
+            txt = (seg.get("text") or "").strip()
 
+            if label not in EVIDENCE_LABELS:
+                problems.append("missing_or_invalid_evidence_label")
+                break
+
+            if not txt:
+                problems.append("empty_segment_text")
+                continue
+
+            # Must not include a leading bracket label in text (label stored separately)
+            if EVIDENCE_TAG_RE.match(txt):
+                problems.append("embedded_bracket_label_in_text_instead_of_field")
+                break
+
+            hits = _text_has_forbidden_patterns(txt)
+            for h in hits:
+                problems.append(h)
+
+            # procedural pressure only: flag sci-fi/horror keywords
+            if re.search(r"\b(alien(s)?|extraterrestrial|spaceship|craft from another world|interdimensional)\b", txt, re.IGNORECASE):
+                problems.append("sensational_terms_present")
+            # discourage "we will show" style promises
+            if re.search(r"\b(you will see|we will prove|this will reveal)\b", txt, re.IGNORECASE):
+                problems.append("future_promise_hype_language")
+
+    # Last-names-only check
+    suspicious_firsts = _find_first_name_mentions_outside_key_players(script_json)
+    if suspicious_firsts:
+        # Don’t fail on one token; fail if there are multiple or if a known first-name appears
+        if len(suspicious_firsts) >= 2:
+            problems.append(f"possible_first_name_mentions_after_key_players: {', '.join(suspicious_firsts[:12])}")
+
+    ok = len(problems) == 0
+    # de-dup problems
+    problems_unique = []
+    seen = set()
+    for p in problems:
+        if p not in seen:
+            seen.add(p)
+            problems_unique.append(p)
+    return ok, problems_unique
 
 # ----------------------------
-# TTS config + caching
+# OpenAI call (JSON Schema enforced) + Repair Loop
 # ----------------------------
-@dataclass
-class TTSConfig:
-    model: str
-    voice: str
-    speed: float = 1.0  # reserved
-    enable_cache: bool = True
-    cache_dir: str = ".uappress_tts_cache"
 
-
-def _ensure_dir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
-
-
-def _sha1(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
-
-
-def _tts_cache_path(cfg: TTSConfig, text: str) -> str:
-    # Cache key includes model + voice + text. (Speed reserved but not applied yet.)
-    key = _sha1(f"model={cfg.model}|voice={cfg.voice}|text={text}")
-    _ensure_dir(cfg.cache_dir)
-    return os.path.join(cfg.cache_dir, f"tts_{key}.wav")
-
-
-# ----------------------------
-# Chunking + cleanup (TTS-stable)
-# ----------------------------
-def chunk_text(text: str, max_chars: int = 2800) -> List[str]:
-    text = re.sub(r"\n{3,}", "\n\n", (text or "")).strip()
-    if not text:
-        return [""]
-
-    if len(text) <= max_chars:
-        return [text]
-
-    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks: List[str] = []
-    buf: List[str] = []
-    length = 0
-
-    for p in parts:
-        add = len(p) + (2 if buf else 0)
-        if buf and (length + add) > max_chars:
-            chunks.append("\n\n".join(buf))
-            buf, length = [p], len(p)
-        else:
-            buf.append(p)
-            length += add
-
-    if buf:
-        chunks.append("\n\n".join(buf))
-    return chunks
-
-
-def strip_tts_directives(text: str) -> str:
+def _call_openai_json(schema: Dict[str, Any], user_brief_json: str, model: str) -> Dict[str, Any]:
     """
-    Remove accidental style/voice directives that might slip into pasted/generated scripts.
-    Keeps narration clean for TTS.
+    Attempts to force valid JSON via responses API with json_schema.
+    Falls back to chat.completions if responses API not available, still enforcing JSON-only text.
     """
-    if not text:
-        return ""
-    t = text
-    t = re.sub(r"(?im)^\s*VOICE\s*DIRECTION.*$\n?", "", t)
-    t = re.sub(r"(?im)^\s*PACE\s*:.*$\n?", "", t)
-    t = re.sub(r"(?im)^\s*STYLE\s*:.*$\n?", "", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
-
-
-# ----------------------------
-# FFmpeg audio ops
-# ----------------------------
-def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
-    """Concatenate WAVs via concat demuxer (stream copy)."""
-    if not wav_paths:
-        raise ValueError("concat_wavs: wav_paths is empty")
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-        for wp in wav_paths:
-            escaped = wp.replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
-        list_path = f.name
-
+    # Primary: Responses API (preferred for strict response_format)
     try:
-        run_ffmpeg([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_wav])
-    finally:
-        try:
-            os.remove(list_path)
-        except Exception:
-            pass
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": CONTRACT_SYSTEM},
+                {"role": "user", "content": f"Generate the script JSON now. Use only the provided brief.\n\nBRIEF (JSON):\n{user_brief_json}"},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": schema,
+            },
+        )
+        text = getattr(resp, "output_text", None)
+        if not text:
+            # Some SDK variants store content in output[0].content[0].text
+            try:
+                text = resp.output[0].content[0].text  # type: ignore
+            except Exception:
+                text = ""
+        return json.loads(text)
+    except Exception:
+        pass
 
-
-def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
-    run_ffmpeg([FFMPEG, "-y", "-i", wav_path, "-c:a", "libmp3lame", "-b:a", bitrate, mp3_path])
-
-
-def get_audio_duration_seconds(path: str) -> float:
-    _, _, err = run_cmd([FFMPEG, "-i", path])
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
-    if not m:
-        return 0.0
-    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-
-
-def mix_music_under_voice(
-    voice_wav: str,
-    music_path: str,
-    out_wav: str,
-    music_db: int = -24,
-    fade_s: int = 6,
-) -> None:
-    """
-    Loop music bed under voice, fade in/out, then loudnorm.
-    Output WAV for later MP3 encoding.
-    """
-    dur = max(0.0, get_audio_duration_seconds(voice_wav))
-    fade_out_start = max(0.0, dur - fade_s)
-
-    filter_complex = (
-        f"[1:a]volume={music_db}dB,"
-        f"afade=t=in:st=0:d={fade_s},"
-        f"afade=t=out:st={fade_out_start}:d={fade_s}[m];"
-        f"[0:a][m]amix=inputs=2:duration=first:dropout_transition=2,"
-        f"loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
+    # Fallback: Chat Completions (best-effort JSON-only)
+    resp2 = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": CONTRACT_SYSTEM},
+            {"role": "user", "content": f"OUTPUT MUST BE VALID JSON ONLY (no markdown). Generate the script JSON now.\n\nBRIEF (JSON):\n{user_brief_json}"},
+        ],
+        temperature=0.2,
     )
+    content = (resp2.choices[0].message.content or "").strip()
+    # Strip accidental code fences
+    content = re.sub(r"^```(json)?\s*", "", content, flags=re.IGNORECASE).strip()
+    content = re.sub(r"\s*```$", "", content).strip()
+    return json.loads(content)
 
-    run_ffmpeg([
-        FFMPEG, "-y",
-        "-i", voice_wav,
-        "-stream_loop", "-1",
-        "-i", music_path,
-        "-filter_complex", filter_complex,
-        "-map", "[aout]",
-        "-c:a", "pcm_s16le",
-        out_wav,
-    ])
+def _repair_with_openai(
+    *,
+    prior_json: Dict[str, Any],
+    violations: List[str],
+    user_brief_json: str,
+    model: str,
+) -> Dict[str, Any]:
+    repair_instructions = {
+        "task": "Repair the JSON to fully comply with the Investigative Documentary Contract.",
+        "violations_detected": violations,
+        "repair_rules": [
+            "Return JSON ONLY. No commentary.",
+            "Do NOT add invented dialogue or quotes.",
+            "Remove mind-reading and cinematic prose.",
+            "Ensure last-names-only after Key Players.",
+            "Keep every segment labeled via evidence_label field.",
+            "Avoid certainty/overclaim language.",
+        ],
+    }
+    # Primary: Responses API with schema again
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": CONTRACT_SYSTEM},
+                {"role": "user", "content": f"BRIEF (JSON):\n{user_brief_json}"},
+                {"role": "user", "content": f"VIOLATIONS + REPAIR INSTRUCTIONS (JSON):\n{json.dumps(repair_instructions, ensure_ascii=False, indent=2)}"},
+                {"role": "user", "content": f"PRIOR OUTPUT JSON:\n{json.dumps(prior_json, ensure_ascii=False)}"},
+                {"role": "user", "content": "Return corrected JSON that matches the JSON Schema now."},
+            ],
+            response_format={"type": "json_schema", "json_schema": SCRIPT_JSON_SCHEMA},
+        )
+        text = getattr(resp, "output_text", None)
+        if not text:
+            try:
+                text = resp.output[0].content[0].text  # type: ignore
+            except Exception:
+                text = ""
+        return json.loads(text)
+    except Exception:
+        pass
 
+    # Fallback: Chat Completions
+    resp2 = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": CONTRACT_SYSTEM},
+            {"role": "user", "content": f"BRIEF (JSON):\n{user_brief_json}"},
+            {"role": "user", "content": f"VIOLATIONS + REPAIR INSTRUCTIONS (JSON):\n{json.dumps(repair_instructions, ensure_ascii=False, indent=2)}"},
+            {"role": "user", "content": f"PRIOR OUTPUT JSON:\n{json.dumps(prior_json, ensure_ascii=False)}"},
+            {"role": "user", "content": "OUTPUT MUST BE VALID JSON ONLY. Return corrected JSON that matches the JSON Schema now."},
+        ],
+        temperature=0.1,
+    )
+    content = (resp2.choices[0].message.content or "").strip()
+    content = re.sub(r"^```(json)?\s*", "", content, flags=re.IGNORECASE).strip()
+    content = re.sub(r"\s*```$", "", content).strip()
+    return json.loads(content)
+
+def _render_script_text(script_json: Dict[str, Any]) -> str:
+    """
+    Produces narration-ready plain text with explicit evidence tags on each paragraph.
+    Ensures output is predictable for downstream TTS.
+    """
+    lines: List[str] = []
+    lines.append(script_json.get("title", "").strip())
+    lines.append("")
+    lines.append(f"CENTRAL QUESTION: {script_json.get('central_question','').strip()}")
+    lines.append("")
+    lines.append("KEY PLAYERS")
+    for kp in script_json.get("key_players", []) or []:
+        full_name = (kp.get("full_name") or "").strip()
+        role = (kp.get("role") or "").strip()
+        why = (kp.get("why_relevant") or "").strip()
+        srcs = kp.get("source_types") or []
+        srcs_s = ", ".join(srcs) if isinstance(srcs, list) else str(srcs)
+        lines.append(f"- {full_name} — {role}. {why} (Source types: {srcs_s})")
+    lines.append("")
+    lines.append("SCRIPT")
+    lines.append("")
+
+    chapters = script_json.get("chapters", []) or []
+    for ch in chapters:
+        n = ch.get("chapter_number")
+        title = (ch.get("chapter_title") or "").strip()
+        start = (ch.get("start_where_previous_ended") or "").strip()
+        lines.append(f"CHAPTER {n}: {title}")
+        lines.append(f"START: {start}")
+        lines.append("")
+        for seg in ch.get("segments", []) or []:
+            label = (seg.get("evidence_label") or "").strip()
+            txt = (seg.get("text") or "").strip()
+            srcs = seg.get("source_types") or []
+            srcs_s = ", ".join(srcs) if isinstance(srcs, list) else str(srcs)
+            # Each paragraph must be tagged
+            lines.append(f"[{label}] {txt} (Source types: {srcs_s})")
+            lines.append("")
+        lines.append("")  # chapter gap
+
+    return "\n".join(lines).strip() + "\n"
 
 # ----------------------------
-# OpenAI TTS → WAV (chunked, cached)
+# Streamlit UI + Generation
 # ----------------------------
-def tts_to_wav(*, text: str, out_wav: str, cfg: TTSConfig) -> None:
-    """
-    Generates narration WAV by chunking and concatenating.
-    Uses per-chunk caching to speed up reruns.
-    """
-    cleaned = strip_tts_directives(sanitize_for_tts(text or ""))
-    if not cleaned.strip():
-        # Tiny silence to avoid downstream failures
-        run_ffmpeg([FFMPEG, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "0.1", out_wav])
-        return
 
-    chunks = chunk_text(cleaned, max_chars=2800)
-    wav_parts: List[str] = []
+st.subheader("Part 2/4 — Script Generation (Contract-Hardened)")
 
-    with tempfile.TemporaryDirectory() as td:
-        for i, ch in enumerate(chunks, 1):
-            payload = strip_tts_directives(sanitize_for_tts(ch))
+if "generated_script_json" not in st.session_state:
+    st.session_state["generated_script_json"] = None
+if "generated_script_text" not in st.session_state:
+    st.session_state["generated_script_text"] = ""
+if "script_generation_log" not in st.session_state:
+    st.session_state["script_generation_log"] = []
 
-            cache_path = _tts_cache_path(cfg, payload) if cfg.enable_cache else ""
-            if cfg.enable_cache and cache_path and os.path.exists(cache_path) and os.path.getsize(cache_path) > 2000:
-                wav_parts.append(cache_path)
-                continue
+model_name = st.session_state.get("script_model") or st.session_state.get("model") or "gpt-4.1-mini"
+max_passes = int(st.session_state.get("script_max_passes") or 3)
 
-            r = client.audio.speech.create(
-                model=cfg.model,
-                voice=cfg.voice,
-                response_format="wav",
-                input=payload,
-            )
+with st.expander("Generator Settings", expanded=False):
+    st.write("Model:", model_name)
+    st.write("Max repair passes:", max_passes)
+    st.caption("Contract is enforced via JSON Schema + deterministic validators + repair loop.")
 
-            part_path = os.path.join(td, f"part_{i:02d}.wav")
-            with open(part_path, "wb") as f:
-                f.write(r.read())
+user_brief_json = _build_user_brief()
 
-            if cfg.enable_cache and cache_path:
-                try:
-                    _ensure_dir(cfg.cache_dir)
-                    with open(cache_path, "wb") as f2, open(part_path, "rb") as f1:
-                        f2.write(f1.read())
-                    wav_parts.append(cache_path)
-                except Exception:
-                    wav_parts.append(part_path)
+colA, colB = st.columns([1, 1])
+with colA:
+    if st.button("Generate Script (Strict)", type="primary", use_container_width=True):
+        st.session_state["script_generation_log"] = []
+        last_json: Dict[str, Any] = {}
+        try:
+            # Pass 1
+            out_json = _call_openai_json(SCRIPT_JSON_SCHEMA, user_brief_json, model_name)
+            ok, problems = _validate_script_json(out_json)
+            st.session_state["script_generation_log"].append({"pass": 1, "ok": ok, "problems": problems})
+            last_json = out_json
+
+            # Repairs
+            pass_num = 1
+            while (not ok) and pass_num < max_passes:
+                pass_num += 1
+                out_json = _repair_with_openai(
+                    prior_json=last_json,
+                    violations=problems,
+                    user_brief_json=user_brief_json,
+                    model=model_name,
+                )
+                ok, problems = _validate_script_json(out_json)
+                st.session_state["script_generation_log"].append({"pass": pass_num, "ok": ok, "problems": problems})
+                last_json = out_json
+
+            # Final gate: if still not ok, hard fail (do not emit unsafe prose)
+            if not ok:
+                st.error("Script blocked by contract enforcement. Fix your brief (scope/players) and retry.")
+                st.session_state["generated_script_json"] = None
+                st.session_state["generated_script_text"] = ""
             else:
-                wav_parts.append(part_path)
+                st.session_state["generated_script_json"] = last_json
+                st.session_state["generated_script_text"] = _render_script_text(last_json)
+                st.success("Script generated and validated against the contract.")
+        except Exception as e:
+            st.session_state["generated_script_json"] = None
+            st.session_state["generated_script_text"] = ""
+            st.error(f"Generation failed: {e}")
 
-        concat_wavs(wav_parts, out_wav)
+with colB:
+    if st.button("Clear Generated Script", use_container_width=True):
+        st.session_state["generated_script_json"] = None
+        st.session_state["generated_script_text"] = ""
+        st.session_state["script_generation_log"] = []
+        st.toast("Cleared.", icon="🧹")
 
+# Output previews
+if st.session_state.get("script_generation_log"):
+    with st.expander("Contract Enforcement Log", expanded=False):
+        st.json(st.session_state["script_generation_log"])
 
-# ----------------------------
-# Packaging helpers
-# ----------------------------
-def make_zip_bytes(files: List[Tuple[str, str]]) -> bytes:
-    """
-    files: [(abs_path, arcname), ...]
-    Returns zip as bytes.
-    """
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for abs_path, arcname in files:
-            if not abs_path or not os.path.exists(abs_path):
-                continue
-            z.write(abs_path, arcname=arcname)
-    buf.seek(0)
-    return buf.read()
+script_text = st.session_state.get("generated_script_text") or ""
+if script_text:
+    st.text_area("Generated Script (Narration-Ready)", value=script_text, height=520)
+
+    # Optional: expose JSON for downstream parts (TTS segmentation, etc.)
+    with st.expander("Generated Script JSON", expanded=False):
+        st.json(st.session_state.get("generated_script_json"))
+
 
 # ============================
 # PART 3/4 — Outline → Full Script Pipeline (STREAMLIT-SAFE) — COPY/PASTE
