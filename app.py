@@ -805,13 +805,29 @@ def has_any_script() -> bool:
     return False
 
 # ============================
-# PART 3/4 — Outline → Full Script Pipeline (UI + Parsing + Population)
+# PART 3/4 — Outline → Full Script Pipeline (UI + Parsing + Population) — PATCHED
 # ============================
+# Goals of this patch:
+# ✅ No StreamlitAPIException: never assign to widget-owned keys after widget creation
+# ✅ Clear separation of: episode metadata, outline text, master script text, parsed sections
+# ✅ Safer generation buttons + validation
+# ✅ Robust chapter detection + parsing guardrails
+# ✅ One place to reset + one place to populate
+# ✅ Keeps already-generated audio untouched (text-only clears)
 
 st.header("1️⃣ Script Creation")
 
 # ----------------------------
-# Episode metadata
+# Session defaults (non-widget keys only)
+# ----------------------------
+st.session_state.setdefault("_OUTLINE_READY", False)
+st.session_state.setdefault("_LAST_OUTLINE_HASH", "")
+st.session_state.setdefault("_LAST_SCRIPT_HASH", "")
+st.session_state.setdefault("MASTER_SCRIPT_TEXT", "")
+st.session_state.setdefault("chapter_count", 0)
+
+# ----------------------------
+# Episode metadata (WIDGET KEYS)
 # ----------------------------
 st.session_state.setdefault("episode_title", "Untitled Episode")
 st.session_state.setdefault("DEFAULT_CHAPTERS", 8)
@@ -831,23 +847,23 @@ with colB:
 st.divider()
 
 # ----------------------------
-# Outline generation
+# Outline generation UI
 # ----------------------------
 st.subheader("🧠 Outline / Treatment")
 
 st.session_state.setdefault("OUTLINE_TEXT", "")
-st.session_state.setdefault("_OUTLINE_READY", False)
 
 outline_btn_col, script_btn_col = st.columns([1, 1])
 
+# Button enable logic (computed; no state mutation)
+_outline_ok = bool(st.session_state.get("episode_title", "").strip())
+_outline_text_ok = bool(st.session_state.get("OUTLINE_TEXT", "").strip())
+
 with outline_btn_col:
-    generate_outline_btn = st.button("Generate Outline", type="primary")
+    generate_outline_btn = st.button("Generate Outline", type="primary", disabled=not _outline_ok)
 
 with script_btn_col:
-    generate_script_btn = st.button(
-        "Generate Full Script",
-        disabled=not bool(st.session_state.get("OUTLINE_TEXT", "").strip()),
-    )
+    generate_script_btn = st.button("Generate Full Script", disabled=not _outline_text_ok)
 
 # ----------------------------
 # Outline text area (editable)
@@ -869,11 +885,59 @@ st.caption(
 
 st.divider()
 
+def _hash_text(s: str) -> str:
+    import hashlib
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+
+def _safe_int(x, default=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+def _clear_script_text_only():
+    # Clears ONLY text fields (intro/chapters/outro + master script). Does NOT touch any audio artifacts.
+    st.session_state["MASTER_SCRIPT_TEXT"] = ""
+    n = _safe_int(st.session_state.get("chapter_count", 0), 0)
+    reset_script_text_fields(n)
+    st.session_state["chapter_count"] = 0
+
+def _populate_from_master_script(raw_script: str):
+    # Detect chapters
+    chapter_map = detect_chapters_and_titles(raw_script)
+    detected_n = max(chapter_map.keys()) if chapter_map else 0
+    if detected_n <= 0:
+        raise ValueError("No CHAPTER headings detected in generated script. Check the model output format.")
+
+    # Reset + parse + populate
+    st.session_state["chapter_count"] = detected_n
+    reset_script_text_fields(detected_n)
+
+    parsed = parse_master_script(raw_script, detected_n)
+
+    intro_txt = (parsed.get("intro") or "").strip()
+    outro_txt = (parsed.get("outro") or "").strip()
+    chapters_dict = parsed.get("chapters") or {}
+
+    if not intro_txt:
+        raise ValueError("Parser returned empty INTRO. The script may be missing an INTRO section.")
+    if not outro_txt:
+        raise ValueError("Parser returned empty OUTRO. The script may be missing an OUTRO section.")
+
+    st.session_state[text_key("intro", 0)] = intro_txt
+    for i in range(1, detected_n + 1):
+        st.session_state[text_key("chapter", i)] = (chapters_dict.get(i) or "").strip()
+    st.session_state[text_key("outro", 0)] = outro_txt
+
+
 # ----------------------------
 # Generate OUTLINE (one-shot)
 # ----------------------------
 if generate_outline_btn:
-    if not st.session_state.get("episode_title", "").strip():
+    title = (st.session_state.get("episode_title") or "").strip()
+    chapters_n = _safe_int(st.session_state.get("DEFAULT_CHAPTERS", 8), 8)
+
+    if not title:
         st.error("Episode title is required.")
         st.stop()
 
@@ -881,39 +945,39 @@ if generate_outline_btn:
         try:
             outline_prompt = f"""
 DOCUMENTARY TITLE:
-{st.session_state['episode_title']}
+{title}
 
 CHAPTER COUNT:
-{int(st.session_state['DEFAULT_CHAPTERS'])}
+{chapters_n}
 
 TASK:
-Generate a documentary OUTLINE ONLY.
+Generate a documentary OUTLINE ONLY. This is NOT narration.
 
-FORMAT:
+FORMAT (STRICT):
 INTRO
 - Time, place, institutional context
 - Key players (full names + roles)
 - Stakes and triggering decision
 
-CHAPTER 1–N:
+CHAPTER 1–{chapters_n}:
 Each chapter must specify:
-- Central decision
+- Central decision (single sentence)
 - Key witness(es)
-- Document or evidence
-- Institutional response
-- Consequence or unresolved tension
+- Primary document/evidence (report, memo, transcript, FOIA, testimony)
+- Institutional response (military, government, media, etc.)
+- Consequence / unresolved tension (what changes after this chapter)
 
-OUTRO:
+OUTRO
 - Human consequences
 - Institutional outcome
-- Open questions
+- Open questions (clearly labeled as questions)
 
 RULES:
 - No narration prose
-- No summaries
-- No speculation
-- No meta commentary
-- Clear chronology
+- No summaries of later chapters inside earlier chapters
+- No speculation or invented quotes
+- No meta commentary about writing or structure
+- Clear chronological flow
 """.strip()
 
             response = client.chat.completions.create(
@@ -928,11 +992,14 @@ RULES:
 
             outline_text = (response.choices[0].message.content or "").strip()
 
-            if "INTRO" not in outline_text.upper() or "CHAPTER" not in outline_text.upper():
-                raise ValueError("Outline generation failed: missing required sections.")
+            # Basic structural validation
+            u = outline_text.upper()
+            if "INTRO" not in u or "CHAPTER" not in u or "OUTRO" not in u:
+                raise ValueError("Outline generation failed: missing INTRO/CHAPTER/OUTRO sections.")
 
             st.session_state["OUTLINE_TEXT"] = outline_text
             st.session_state["_OUTLINE_READY"] = True
+            st.session_state["_LAST_OUTLINE_HASH"] = _hash_text(outline_text)
             st.success("Outline generated. Review and edit before generating full script.")
 
         except Exception as e:
@@ -942,43 +1009,42 @@ RULES:
 # Generate FULL SCRIPT (uses outline)
 # ----------------------------
 if generate_script_btn:
-    if not st.session_state.get("OUTLINE_TEXT", "").strip():
+    title = (st.session_state.get("episode_title") or "").strip()
+    outline = (st.session_state.get("OUTLINE_TEXT") or "").strip()
+    chapters_n = _safe_int(st.session_state.get("DEFAULT_CHAPTERS", 8), 8)
+
+    if not title:
+        st.error("Episode title is required.")
+        st.stop()
+    if not outline:
         st.error("Outline is required before generating the full script.")
         st.stop()
 
     with st.spinner("Generating full investigative documentary script…"):
         try:
+            # If user edited outline, refresh hash (this is safe; not a widget-owned key)
+            st.session_state["_LAST_OUTLINE_HASH"] = _hash_text(outline)
+
             raw_script = generate_master_script_one_shot(
-                topic=st.session_state.get("episode_title", ""),
-                outline=st.session_state.get("OUTLINE_TEXT", ""),
-                chapters=int(st.session_state.get("DEFAULT_CHAPTERS", 8)),
+                topic=title,
+                outline=outline,
+                chapters=chapters_n,
                 model=st.session_state.get("SCRIPT_MODEL", "gpt-4o-mini"),
             )
 
-            # Store raw script
+            raw_script = (raw_script or "").strip()
+            if not raw_script:
+                raise ValueError("Script generation returned empty output.")
+
+            # Store raw script (non-widget key)
             st.session_state["MASTER_SCRIPT_TEXT"] = raw_script
+            st.session_state["_LAST_SCRIPT_HASH"] = _hash_text(raw_script)
 
-            # Detect chapters
-            chapter_map = detect_chapters_and_titles(raw_script)
-            detected_n = max(chapter_map.keys()) if chapter_map else 0
-            if detected_n <= 0:
-                raise ValueError("No CHAPTER headings detected in generated script.")
+            # Populate editor fields from the script
+            _populate_from_master_script(raw_script)
 
-            # Reset fields safely
-            st.session_state["chapter_count"] = detected_n
-            reset_script_text_fields(detected_n)
-
-            # Parse + populate
-            parsed = parse_master_script(raw_script, detected_n)
-
-            st.session_state[text_key("intro", 0)] = parsed.get("intro", "").strip()
-            for i in range(1, detected_n + 1):
-                st.session_state[text_key("chapter", i)] = (
-                    parsed.get("chapters", {}).get(i, "") or ""
-                ).strip()
-            st.session_state[text_key("outro", 0)] = parsed.get("outro", "").strip()
-
-            st.success(f"Full script generated: Intro + {detected_n} chapters + Outro.")
+            n = _safe_int(st.session_state.get("chapter_count", 0), 0)
+            st.success(f"Full script generated: Intro + {n} chapters + Outro.")
 
         except Exception as e:
             st.error(str(e))
@@ -999,7 +1065,7 @@ st.text_area(
 st.divider()
 
 # Chapters
-chapter_count = int(st.session_state.get("chapter_count", 0))
+chapter_count = _safe_int(st.session_state.get("chapter_count", 0), 0)
 if chapter_count > 0:
     for i in range(1, chapter_count + 1):
         with st.expander(f"CHAPTER {i}", expanded=(i == 1)):
@@ -1025,28 +1091,47 @@ st.text_area(
 # Reset controls
 # ----------------------------
 st.divider()
-c1, c2, c3 = st.columns([1, 1, 2])
+c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
 
 with c1:
     if st.button("Clear Script"):
-        reset_script_text_fields(st.session_state.get("chapter_count", 0))
-        st.session_state["chapter_count"] = 0
-        st.success("Script cleared.")
+        _clear_script_text_only()
+        st.success("Script cleared (text only).")
 
 with c2:
     if st.button("Clear Outline"):
         st.session_state["OUTLINE_TEXT"] = ""
         st.session_state["_OUTLINE_READY"] = False
+        st.session_state["_LAST_OUTLINE_HASH"] = ""
         st.success("Outline cleared.")
 
 with c3:
+    if st.button("Reload From Master Script", disabled=not bool(st.session_state.get("MASTER_SCRIPT_TEXT", "").strip())):
+        try:
+            _populate_from_master_script(st.session_state.get("MASTER_SCRIPT_TEXT", ""))
+            st.success("Re-parsed and reloaded editor fields from MASTER_SCRIPT_TEXT.")
+        except Exception as e:
+            st.error(str(e))
+
+with c4:
     st.caption("Clearing text does not affect any already-generated audio.")
 
 # ============================
-# PART 4/4 — Audio Build (Per-Section + Full Episode) + Downloads + Final ZIP
+# PART 4/4 — Audio Build (Per-Section + Full Episode) + QC + Downloads + Final ZIP — PATCHED
 # ============================
+# Goals of this patch:
+# ✅ Build ALL or build SELECTED sections (Intro-only QC is fast)
+# ✅ Per-section QC: audio player + duration + download
+# ✅ Robust FULL episode build (re-encode WAVs → concat WAV → encode MP3) to avoid mp3 concat/copy glitches
+# ✅ Optional "Force rebuild" per run (ignores cache + overwrites outputs)
+# ✅ Music upload stored into WORKDIR (persists across reruns; avoids temp file disappearing)
+# ✅ Final ZIP is clean: section mp3 + section txt + optional FULL mp3 + master script txt
 
 st.header("3️⃣ Create Audio (Onyx + Music)")
+
+import tempfile
+import os
+from typing import Dict, List, Tuple
 
 # ----------------------------
 # Workdir (Streamlit-safe)
@@ -1055,6 +1140,8 @@ def _workdir() -> str:
     st.session_state.setdefault("WORKDIR", tempfile.mkdtemp(prefix="uappress_tts_"))
     return st.session_state["WORKDIR"]
 
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
 def _safe_remove(path: str) -> None:
     try:
@@ -1063,16 +1150,14 @@ def _safe_remove(path: str) -> None:
     except Exception:
         pass
 
-
 def write_text_file(path: str, text: str) -> None:
+    _ensure_dir(os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as f:
         f.write((text or "").strip() + "\n")
-
 
 def episode_slug() -> str:
     title = st.session_state.get("episode_title", "Untitled Episode")
     return clean_filename(title)
-
 
 def section_output_paths(section_id: str, episode_slug_: str) -> Dict[str, str]:
     wd = _workdir()
@@ -1080,26 +1165,47 @@ def section_output_paths(section_id: str, episode_slug_: str) -> Dict[str, str]:
     return {
         "voice_wav": os.path.join(wd, f"{base}__voice.wav"),
         "mixed_wav": os.path.join(wd, f"{base}__mix.wav"),
+        "final_wav": os.path.join(wd, f"{base}__final.wav"),  # unified 48k stereo WAV for concat safety
         "mp3": os.path.join(wd, f"{base}.mp3"),
         "txt": os.path.join(wd, f"{base}.txt"),
     }
 
+# ----------------------------
+# Duration helper (ffprobe via imageio_ffmpeg bundled ffmpeg)
+# ----------------------------
+def _duration_seconds(media_path: str) -> float:
+    try:
+        return float(get_media_duration_seconds(media_path))
+    except Exception:
+        return 0.0
 
 # ----------------------------
-# Music upload / selection
+# Music upload / selection (persist inside WORKDIR)
 # ----------------------------
+st.subheader("🎵 Music Bed (Optional)")
+
 music_file = st.file_uploader(
     "Optional music bed (mp3/wav/m4a)",
     type=["mp3", "wav", "m4a"],
 )
 
+# Persist chosen/uploaded music path in session_state
+st.session_state.setdefault("MUSIC_PATH", "")
 music_path = ""
+
 if music_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{music_file.name}") as tf:
-        tf.write(music_file.read())
-        music_path = tf.name
+    # Save upload into WORKDIR to survive reruns
+    wd = _workdir()
+    _ensure_dir(wd)
+    save_name = clean_filename(music_file.name)
+    persisted = os.path.join(wd, f"__music__{save_name}")
+    with open(persisted, "wb") as f:
+        f.write(music_file.read())
+    st.session_state["MUSIC_PATH"] = persisted
+    music_path = persisted
 else:
-    music_path = st.session_state.get("DEFAULT_MUSIC_PATH", "") or ""
+    # Fall back to last uploaded or a configured default
+    music_path = st.session_state.get("MUSIC_PATH", "") or st.session_state.get("DEFAULT_MUSIC_PATH", "") or ""
 
 use_music = st.checkbox(
     "Mix music under voice",
@@ -1110,6 +1216,13 @@ use_music = st.checkbox(
 music_db_i = int(st.session_state.get("MUSIC_DB", -24))
 fade_s_i = int(st.session_state.get("MUSIC_FADE_S", 6))
 
+if use_music:
+    if music_path and os.path.exists(music_path):
+        st.caption(f"Music bed loaded: {os.path.basename(music_path)}")
+    else:
+        st.warning("Music mixing enabled, but no music file is loaded. Upload one (or set DEFAULT_MUSIC_PATH).")
+
+st.divider()
 
 # ----------------------------
 # TTS config
@@ -1124,7 +1237,6 @@ cfg = TTSConfig(
 
 st.caption(f"TTS: model={cfg.model} | voice={cfg.voice} | cache={'on' if cfg.enable_cache else 'off'}")
 
-
 # ----------------------------
 # Build one section
 # ----------------------------
@@ -1137,11 +1249,13 @@ def build_one_section(
     music_path: str,
     music_db: int,
     fade_s: int,
+    force: bool = False,
 ) -> Dict[str, str]:
     """
     Produces:
       - voice WAV
       - optional mixed WAV
+      - final_wav (unified WAV for safe concat)
       - MP3
       - TXT (clean narration)
     """
@@ -1151,14 +1265,20 @@ def build_one_section(
     cleaned = strip_tts_directives(sanitize_for_tts(text or ""))
     write_text_file(paths["txt"], cleaned)
 
+    # Force rebuild: remove outputs (cache behavior still depends on your tts_to_wav implementation;
+    # this guarantees files are overwritten even if cache is on)
+    if force:
+        for k in ["voice_wav", "mixed_wav", "final_wav", "mp3"]:
+            _safe_remove(paths[k])
+
     # 1) TTS → voice WAV
     tts_to_wav(text=cleaned, out_wav=paths["voice_wav"], cfg=cfg)
 
     # 2) Optional music mix
-    final_wav = paths["voice_wav"]
+    intermediate_wav = paths["voice_wav"]
     if mix_music:
         if not music_path or not os.path.exists(music_path):
-            raise FileNotFoundError("Music bed not found.")
+            raise FileNotFoundError("Music bed not found (upload one or disable mixing).")
         mix_music_under_voice(
             voice_wav=paths["voice_wav"],
             music_path=music_path,
@@ -1166,13 +1286,22 @@ def build_one_section(
             music_db=music_db,
             fade_s=fade_s,
         )
-        final_wav = paths["mixed_wav"]
+        intermediate_wav = paths["mixed_wav"]
 
-    # 3) WAV → MP3
-    wav_to_mp3(final_wav, paths["mp3"], bitrate="192k")
+    # 3) Re-encode to a UNIFIED WAV for concat reliability (48kHz, 2ch, pcm_s16le)
+    run_ffmpeg([
+        FFMPEG, "-y",
+        "-i", intermediate_wav,
+        "-ar", "48000",
+        "-ac", "2",
+        "-c:a", "pcm_s16le",
+        paths["final_wav"]
+    ])
+
+    # 4) Unified WAV → MP3
+    wav_to_mp3(paths["final_wav"], paths["mp3"], bitrate="192k")
 
     return paths
-
 
 # ----------------------------
 # Section list helper
@@ -1191,10 +1320,8 @@ def section_texts() -> List[Tuple[str, str]]:
     out.append(("99_outro", st.session_state.get(text_key("outro", 0), "")))
     return out
 
-
 def has_any_script() -> bool:
     return any((t or "").strip() for _, t in section_texts())
-
 
 # ----------------------------
 # Build controls
@@ -1210,27 +1337,51 @@ else:
     sections = section_texts()
     ordered_ids = [sid for sid, _ in sections]
 
+    # Build mode controls
+    ids_with_text = [sid for sid, txt in sections if (txt or "").strip()]
+    default_select = ["00_intro"] if "00_intro" in ids_with_text else (ids_with_text[:1] if ids_with_text else [])
+    selected_ids = st.multiselect(
+        "Select sections to build",
+        options=ids_with_text,
+        default=default_select,
+        help="Tip: build Intro first to QC voice + pacing before building everything.",
+    )
+
+    force_rebuild = st.checkbox(
+        "Force rebuild (overwrite outputs)",
+        value=False,
+        help="If checked, deletes section outputs first and rebuilds them.",
+    )
+
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
-        build_all_btn = st.button("Build ALL Sections", type="primary")
+        build_selected_btn = st.button("Build SELECTED", type="primary", disabled=not bool(selected_ids))
     with c2:
-        clear_built_btn = st.button("Clear Built Audio")
+        build_all_btn = st.button("Build ALL Sections")
     with c3:
-        st.caption("Tip: build Intro first to QC voice and pacing.")
+        clear_built_btn = st.button("Clear Built Audio")
 
     if clear_built_btn:
         wd = _workdir()
         for name in os.listdir(wd):
+            # Don't delete persisted music unless it's one of our generated artifacts
+            if name.startswith("__music__"):
+                continue
             _safe_remove(os.path.join(wd, name))
         st.session_state["built_sections"] = {}
-        st.success("Cleared built audio.")
+        st.success("Cleared built audio (kept persisted music bed).")
 
-    # Build all
-    if build_all_btn:
-        with st.spinner("Building all sections…"):
+    def _build_ids(to_build: List[str]):
+        with st.spinner("Building audio…"):
+            prog = st.progress(0)
+            total = max(len(to_build), 1)
+            built = 0
             for sid, txt in sections:
+                if sid not in to_build:
+                    continue
                 if not (txt or "").strip():
                     continue
+
                 out_paths = build_one_section(
                     section_id=sid,
                     text=txt,
@@ -1239,50 +1390,113 @@ else:
                     music_path=music_path,
                     music_db=music_db_i,
                     fade_s=fade_s_i,
+                    force=force_rebuild,
                 )
                 built_sections[sid] = out_paths
-            st.success("All sections built.")
+                built += 1
+                prog.progress(min(built / total, 1.0))
+            st.success("Build complete.")
 
+    if build_selected_btn:
+        _build_ids(selected_ids)
+
+    if build_all_btn:
+        _build_ids(ids_with_text)
+
+    # ----------------------------
+    # Per-section QC + downloads
+    # ----------------------------
+    st.divider()
+    st.subheader("🔎 Section QC (Playback + Downloads)")
+
+    any_built = False
+    for sid in ordered_ids:
+        paths = built_sections.get(sid) or {}
+        mp3_path = paths.get("mp3", "")
+        txt_path = paths.get("txt", "")
+        if mp3_path and os.path.exists(mp3_path):
+            any_built = True
+            dur = _duration_seconds(mp3_path)
+            with st.expander(f"{sid}  —  {dur:.1f}s", expanded=(sid == "00_intro")):
+                st.audio(mp3_path)
+
+                colx, coly = st.columns([1, 1])
+                with colx:
+                    with open(mp3_path, "rb") as f:
+                        st.download_button(
+                            f"Download {sid} MP3",
+                            data=f.read(),
+                            file_name=os.path.basename(mp3_path),
+                            mime="audio/mpeg",
+                        )
+                with coly:
+                    if txt_path and os.path.exists(txt_path):
+                        with open(txt_path, "rb") as f:
+                            st.download_button(
+                                f"Download {sid} TXT",
+                                data=f.read(),
+                                file_name=os.path.basename(txt_path),
+                                mime="text/plain",
+                            )
+
+    if not any_built:
+        st.info("No built sections yet. Build Intro first to verify voice + pacing.")
 
 # ----------------------------
-# Build FULL episode MP3
+# Build FULL episode MP3 (robust concat via WAV)
 # ----------------------------
 st.divider()
 st.subheader("🎬 Build FULL Episode MP3")
 
 ep_slug = episode_slug()
 full_mp3_path = os.path.join(_workdir(), f"{ep_slug}__FULL.mp3")
+full_wav_path = os.path.join(_workdir(), f"{ep_slug}__FULL.wav")
 
-
-def concat_mp3s(mp3_paths: List[str], out_mp3: str) -> None:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-        for p in mp3_paths:
-            f.write(f"file '{p.replace('\'', '\'\\\'\'')}'\n")
+def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
+    # concat demuxer (WAV) is reliable if formats match (we enforce unified WAV per section)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        for p in wav_paths:
+            # ffmpeg concat list expects escaping; safest is to wrap and replace single quotes
+            safe_p = p.replace("'", r"'\''")
+            f.write(f"file '{safe_p}'\n")
         list_path = f.name
 
     try:
-        run_ffmpeg([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_mp3])
+        run_ffmpeg([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_wav])
     finally:
         _safe_remove(list_path)
 
-
-def build_full_episode(built_sections: Dict[str, Dict[str, str]]) -> None:
-    mp3s = []
+def build_full_episode(built_sections: Dict[str, Dict[str, str]], ordered_ids: List[str]) -> None:
+    wavs: List[str] = []
     for sid in ordered_ids:
-        p = built_sections.get(sid, {}).get("mp3")
+        p = (built_sections.get(sid) or {}).get("final_wav")
         if p and os.path.exists(p):
-            mp3s.append(p)
-    if not mp3s:
-        raise ValueError("No section MP3s found.")
-    concat_mp3s(mp3s, full_mp3_path)
+            wavs.append(p)
 
+    if not wavs:
+        raise ValueError("No built section WAVs found. Build sections first.")
+
+    # Build full wav then encode mp3 (uniform, predictable)
+    _safe_remove(full_wav_path)
+    _safe_remove(full_mp3_path)
+
+    concat_wavs(wavs, full_wav_path)
+    wav_to_mp3(full_wav_path, full_mp3_path, bitrate="192k")
 
 if st.button("Build FULL Episode MP3", type="primary"):
+    built_sections = st.session_state.get("built_sections", {}) or {}
+    sections = section_texts()
+    ordered_ids = [sid for sid, _ in sections]
     with st.spinner("Building full episode…"):
-        build_full_episode(built_sections)
-        st.success("Full episode MP3 built.")
+        try:
+            build_full_episode(built_sections, ordered_ids)
+            st.success("Full episode MP3 built.")
+        except Exception as e:
+            st.error(str(e))
 
 if os.path.exists(full_mp3_path):
+    dur = _duration_seconds(full_mp3_path)
+    st.caption(f"FULL episode duration: {dur/60.0:.1f} min")
     st.audio(full_mp3_path)
     with open(full_mp3_path, "rb") as f:
         st.download_button(
@@ -1292,29 +1506,45 @@ if os.path.exists(full_mp3_path):
             mime="audio/mpeg",
         )
 
-
 # ----------------------------
-# Final ZIP
+# Final ZIP (clean + deterministic)
 # ----------------------------
 st.divider()
 st.subheader("📦 Final Delivery ZIP")
 
+include_full_in_zip = st.checkbox(
+    "Include FULL episode MP3 in ZIP (if built)",
+    value=True,
+)
+
 if st.button("Build FINAL ZIP"):
+    built_sections = st.session_state.get("built_sections", {}) or {}
     files: List[Tuple[str, str]] = []
 
-    if os.path.exists(full_mp3_path):
+    # Optional FULL
+    if include_full_in_zip and os.path.exists(full_mp3_path):
         files.append((full_mp3_path, os.path.basename(full_mp3_path)))
 
+    # Section MP3 + TXT (only if exists)
     for sid, paths in built_sections.items():
-        if paths.get("mp3"):
-            files.append((paths["mp3"], os.path.basename(paths["mp3"])))
-        if paths.get("txt"):
-            files.append((paths["txt"], os.path.basename(paths["txt"])))
+        mp3p = paths.get("mp3")
+        txtp = paths.get("txt")
+        if mp3p and os.path.exists(mp3p):
+            files.append((mp3p, os.path.basename(mp3p)))
+        if txtp and os.path.exists(txtp):
+            files.append((txtp, os.path.basename(txtp)))
 
+    # Master script
     raw_path = os.path.join(_workdir(), f"{ep_slug}__MASTER_SCRIPT.txt")
     with open(raw_path, "w", encoding="utf-8") as f:
-        f.write((st.session_state.get("MASTER_SCRIPT_TEXT", "") or "").strip())
+        f.write((st.session_state.get("MASTER_SCRIPT_TEXT", "") or "").strip() + "\n")
     files.append((raw_path, os.path.basename(raw_path)))
+
+    # Outline (nice to ship)
+    outline_path = os.path.join(_workdir(), f"{ep_slug}__OUTLINE.txt")
+    with open(outline_path, "w", encoding="utf-8") as f:
+        f.write((st.session_state.get("OUTLINE_TEXT", "") or "").strip() + "\n")
+    files.append((outline_path, os.path.basename(outline_path)))
 
     zip_bytes = make_zip_bytes(files)
     st.download_button(
@@ -1323,3 +1553,4 @@ if st.button("Build FINAL ZIP"):
         file_name=f"{ep_slug}__FINAL.zip",
         mime="application/zip",
     )
+
