@@ -480,6 +480,347 @@ def parse_master_script(master_text: str, expected_chapters: int) -> Dict[str, o
     }
 
 # ============================
+# PART 2/4 — OpenAI Script Generator + TTS Engine + FFmpeg Audio Ops + Cache + ZIP Helpers (FIXED)
+# ============================
+# Drop this block BETWEEN Part 1 and Part 3.
+#
+# Fixes included:
+# ✅ Defines generate_master_script_one_shot (your Part 3 calls this)
+# ✅ Defines get_media_duration_seconds (your Part 4 expects this)
+# ✅ Provides TTSConfig + caching + chunking + tts_to_wav
+# ✅ Keeps your SUPER_ROLE_PROMPT + SUPER_SCRIPT_CONTRACT usage
+# ✅ Robust ffmpeg concat list escaping
+# ✅ make_zip_bytes helper
+#
+# NOTE: This part assumes Part 1 already defined:
+# - client (OpenAI)
+# - st, os, re, io, time, zipfile, tempfile, hashlib, dataclass, List, Tuple, Optional
+# - FFMPEG, run_ffmpeg, run_cmd
+# - sanitize_for_tts, clean_filename, text_key
+#
+# ============================
+
+# ----------------------------
+# Script generation (Outline/Treatment -> Full Script)
+# ----------------------------
+def _build_generation_prompt(*, topic: str, master_prompt: str, chapters: int) -> str:
+    """
+    Builds the USER prompt. System behavior is controlled by:
+      - SUPER_ROLE_PROMPT
+      - SUPER_SCRIPT_CONTRACT
+
+    IMPORTANT:
+    - master_prompt can be your outline/treatment text
+    - Keep plain text (no markdown)
+    """
+    topic = (topic or "").strip()
+    master_prompt = (master_prompt or "").strip()
+    chapters = max(3, int(chapters or 0))
+
+    return f"""
+DOCUMENTARY TITLE:
+{topic}
+
+CHAPTER COUNT:
+{chapters}
+
+OUTLINE / TREATMENT (DO NOT NARRATE THIS AS META):
+{master_prompt}
+
+FINAL INSTRUCTION:
+Generate the complete long-form investigative documentary script now.
+Return ONLY the script text in the strict template required by the contract.
+""".strip()
+
+
+def generate_master_script_one_shot(
+    *,
+    topic: str,
+    master_prompt: str,
+    chapters: int,
+    model: str,
+    temperature: float = 0.55,
+    tries: int = 2,
+) -> str:
+    """
+    One-shot generation:
+      - Uses SUPER_ROLE_PROMPT + SUPER_SCRIPT_CONTRACT as system messages
+      - Forces strict template (INTRO / CHAPTER N / OUTRO)
+      - Returns raw text (to be parsed by parse_master_script in Part 1)
+    """
+    chapters = max(3, int(chapters or 0))
+    user_prompt = _build_generation_prompt(topic=topic, master_prompt=master_prompt, chapters=chapters)
+
+    last_err: Optional[Exception] = None
+    for attempt in range(max(1, int(tries or 1))):
+        try:
+            r = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SUPER_ROLE_PROMPT},
+                    {"role": "system", "content": SUPER_SCRIPT_CONTRACT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature if attempt == 0 else max(0.2, float(temperature) - 0.25),
+            )
+
+            txt = (r.choices[0].message.content or "").strip()
+            u = txt.upper()
+
+            # Parser-safe sanity checks
+            if "INTRO" not in u or "OUTRO" not in u:
+                raise ValueError("Model output missing INTRO/OUTRO headings.")
+            if "CHAPTER" not in u:
+                raise ValueError("Model output missing CHAPTER headings.")
+
+            # Reject common drift modes
+            banned = [
+                "HIGH-LEVEL ASSESSMENT",
+                "FINAL VERDICT",
+                "WHAT WORKS",
+                "PROPOSED IMPROVEMENTS",
+                "SUMMARY:",
+                "CONCLUSION:",
+            ]
+            if attempt == 0 and any(b in u for b in banned):
+                raise ValueError("Model output included editorial sections (not allowed).")
+
+            return txt
+
+        except Exception as e:
+            last_err = e
+            time.sleep(0.6)
+            user_prompt += "\n\nSTRICT REMINDER: Output ONLY the required template headings + narration text. No commentary."
+            continue
+
+    raise RuntimeError(f"Script generation failed: {last_err}")
+
+
+# ----------------------------
+# TTS config + caching
+# ----------------------------
+@dataclass
+class TTSConfig:
+    model: str
+    voice: str
+    speed: float = 1.0  # reserved (not applied)
+    enable_cache: bool = True
+    cache_dir: str = ".uappress_tts_cache"
+
+
+def _ensure_dir2(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+
+
+def _tts_cache_path(cfg: TTSConfig, text: str) -> str:
+    key = _sha1(f"model={cfg.model}|voice={cfg.voice}|text={text}")
+    _ensure_dir2(cfg.cache_dir)
+    return os.path.join(cfg.cache_dir, f"tts_{key}.wav")
+
+
+# ----------------------------
+# Chunking + cleanup (TTS-stable)
+# ----------------------------
+def chunk_text(text: str, max_chars: int = 2800) -> List[str]:
+    text = re.sub(r"\n{3,}", "\n\n", (text or "")).strip()
+    if not text:
+        return [""]
+
+    if len(text) <= max_chars:
+        return [text]
+
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks: List[str] = []
+    buf: List[str] = []
+    length = 0
+
+    for p in parts:
+        add = len(p) + (2 if buf else 0)
+        if buf and (length + add) > max_chars:
+            chunks.append("\n\n".join(buf))
+            buf, length = [p], len(p)
+        else:
+            buf.append(p)
+            length += add
+
+    if buf:
+        chunks.append("\n\n".join(buf))
+    return chunks
+
+
+def strip_tts_directives(text: str) -> str:
+    """
+    Remove accidental style/voice directives that might slip into pasted/generated scripts.
+    Keeps narration clean for TTS.
+    """
+    if not text:
+        return ""
+    t = text
+    t = re.sub(r"(?im)^\s*VOICE\s*DIRECTION.*$\n?", "", t)
+    t = re.sub(r"(?im)^\s*PACE\s*:.*$\n?", "", t)
+    t = re.sub(r"(?im)^\s*STYLE\s*:.*$\n?", "", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+# ----------------------------
+# Media duration (for Part 4 UI)
+# ----------------------------
+def get_media_duration_seconds(path: str) -> float:
+    """
+    Uses ffmpeg stderr Duration line. Works on mp3/wav/m4a/mp4.
+    """
+    try:
+        _, _, err = run_cmd([FFMPEG, "-i", path])
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
+        if not m:
+            return 0.0
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        return 0.0
+
+
+# ----------------------------
+# FFmpeg audio ops
+# ----------------------------
+def _ff_concat_list_escape(p: str) -> str:
+    # ffmpeg concat list uses single quotes; escape single quote safely
+    return (p or "").replace("'", r"'\''")
+
+
+def concat_wavs(wav_paths: List[str], out_wav: str) -> None:
+    """
+    Concatenate WAVs via concat demuxer (stream copy).
+    REQUIREMENT: WAV formats must match. (Part 4 enforces unified WAV.)
+    """
+    if not wav_paths:
+        raise ValueError("concat_wavs: wav_paths is empty")
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        for wp in wav_paths:
+            f.write(f"file '{_ff_concat_list_escape(wp)}'\n")
+        list_path = f.name
+
+    try:
+        run_ffmpeg([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_wav])
+    finally:
+        try:
+            os.remove(list_path)
+        except Exception:
+            pass
+
+
+def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
+    run_ffmpeg([FFMPEG, "-y", "-i", wav_path, "-c:a", "libmp3lame", "-b:a", bitrate, mp3_path])
+
+
+def mix_music_under_voice(
+    voice_wav: str,
+    music_path: str,
+    out_wav: str,
+    music_db: int = -24,
+    fade_s: int = 6,
+) -> None:
+    """
+    Loop music bed under voice, fade in/out, then loudnorm.
+    Output WAV for later MP3 encoding.
+    """
+    dur = max(0.0, float(get_media_duration_seconds(voice_wav)))
+    fade_out_start = max(0.0, dur - float(fade_s))
+
+    filter_complex = (
+        f"[1:a]volume={int(music_db)}dB,"
+        f"afade=t=in:st=0:d={int(fade_s)},"
+        f"afade=t=out:st={fade_out_start}:d={int(fade_s)}[m];"
+        f"[0:a][m]amix=inputs=2:duration=first:dropout_transition=2,"
+        f"loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
+    )
+
+    run_ffmpeg([
+        FFMPEG, "-y",
+        "-i", voice_wav,
+        "-stream_loop", "-1",
+        "-i", music_path,
+        "-filter_complex", filter_complex,
+        "-map", "[aout]",
+        "-c:a", "pcm_s16le",
+        out_wav,
+    ])
+
+
+# ----------------------------
+# OpenAI TTS → WAV (chunked, cached)
+# ----------------------------
+def tts_to_wav(*, text: str, out_wav: str, cfg: TTSConfig) -> None:
+    """
+    Generates narration WAV by chunking and concatenating.
+    Uses per-chunk caching to speed up reruns.
+    """
+    cleaned = strip_tts_directives(sanitize_for_tts(text or ""))
+    if not cleaned.strip():
+        # Tiny silence to avoid downstream failures
+        run_ffmpeg([FFMPEG, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "0.1", out_wav])
+        return
+
+    chunks = chunk_text(cleaned, max_chars=2800)
+    wav_parts: List[str] = []
+
+    with tempfile.TemporaryDirectory() as td:
+        for i, ch in enumerate(chunks, 1):
+            payload = strip_tts_directives(sanitize_for_tts(ch))
+
+            cache_path = _tts_cache_path(cfg, payload) if cfg.enable_cache else ""
+            if cfg.enable_cache and cache_path and os.path.exists(cache_path) and os.path.getsize(cache_path) > 2000:
+                wav_parts.append(cache_path)
+                continue
+
+            r = client.audio.speech.create(
+                model=cfg.model,
+                voice=cfg.voice,
+                response_format="wav",
+                input=payload,
+            )
+
+            part_path = os.path.join(td, f"part_{i:02d}.wav")
+            with open(part_path, "wb") as f:
+                f.write(r.read())
+
+            if cfg.enable_cache and cache_path:
+                try:
+                    _ensure_dir2(cfg.cache_dir)
+                    with open(cache_path, "wb") as f2, open(part_path, "rb") as f1:
+                        f2.write(f1.read())
+                    wav_parts.append(cache_path)
+                except Exception:
+                    wav_parts.append(part_path)
+            else:
+                wav_parts.append(part_path)
+
+        concat_wavs(wav_parts, out_wav)
+
+
+# ----------------------------
+# Packaging helpers
+# ----------------------------
+def make_zip_bytes(files: List[Tuple[str, str]]) -> bytes:
+    """
+    files: [(abs_path, arcname), ...]
+    Returns zip as bytes.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for abs_path, arcname in files:
+            if not abs_path or not os.path.exists(abs_path):
+                continue
+            z.write(abs_path, arcname=arcname)
+    buf.seek(0)
+    return buf.read()
+
+# ============================
 # PART 3/4 — Outline → Full Script Pipeline (STREAMLIT-SAFE)
 # ============================
 
@@ -1042,7 +1383,7 @@ if st.button("Build FINAL ZIP"):
     # Outline (nice to ship)
     outline_path = os.path.join(_workdir(), f"{ep_slug}__OUTLINE.txt")
     with open(outline_path, "w", encoding="utf-8") as f:
-        f.write((st.session_state.get("OUTLINE_TEXT", "") or "").strip() + "\n")
+        f.write((st.session_state.get("OUTLINE_TEXT_SRC", "") or "").strip() + "\n")
     files.append((outline_path, os.path.basename(outline_path)))
 
     zip_bytes = make_zip_bytes(files)
