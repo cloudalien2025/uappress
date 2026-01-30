@@ -762,13 +762,17 @@ def _repair_with_openai(*, prior_json: Dict[str, Any], violations: List[str], us
             ],
             response_format={"type": "json_schema", "json_schema": SCRIPT_JSON_SCHEMA},
         )
-        text = getattr(resp, "output_text", None)
-        if not text:
-            try:
-                text = resp.output[0].content[0].text  # type: ignore
-            except Exception:
-                text = ""
-        return json.loads(text)
+        # Preferred: SDK-parsed JSON (responses API)
+if hasattr(resp, "output_parsed") and isinstance(resp.output_parsed, dict):
+    return resp.output_parsed
+
+# Fallback: extract text and parse manually
+try:
+    text = resp.output[0].content[0].text
+    return json.loads(text)
+except Exception as e:
+    raise RuntimeError(f"Structured JSON extraction failed: {e}")
+
     except Exception:
         pass
 
