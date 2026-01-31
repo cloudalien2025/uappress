@@ -267,22 +267,36 @@ with right:
     )
 
 # ============================
-# PART 3/4 — HQ Audio Pipeline (Onyx → WAV master → Loudness normalize → MP3 320k)
-# Append below Part 2
+# PART 3/4 — HQ Audio Pipeline (Onyx → WAV master → Tail-pad → Loudness normalize → MP3 320k)
+# Replace your existing Part 3/4 block with this entire block
 # ============================
 
 def _collect_segments() -> List[Tuple[str, str]]:
+    """
+    Collect Intro/Chapters/Outro and ensure each segment ends cleanly
+    so TTS doesn't stop abruptly on the last syllable.
+    """
+    def _ensure_terminal_punct(s: str) -> str:
+        s = (s or "").strip()
+        if not s:
+            return s
+        # If it already ends with punctuation, leave it.
+        if re.search(r"[.!?…]\s*$", s):
+            return s
+        # Add a period to encourage a natural stop.
+        return s + "."
+
     segs: List[Tuple[str, str]] = []
-    intro = (st.session_state.intro_text or "").strip()
+    intro = _ensure_terminal_punct(st.session_state.intro_text)
     if intro:
         segs.append(("intro", intro))
 
     for i, ch in enumerate(st.session_state.chapters, start=1):
-        txt = (ch.get("text") or "").strip()
+        txt = _ensure_terminal_punct(ch.get("text") or "")
         if txt:
             segs.append((f"chapter_{i:02d}", txt))
 
-    outro = (st.session_state.outro_text or "").strip()
+    outro = _ensure_terminal_punct(st.session_state.outro_text)
     if outro:
         segs.append(("outro", outro))
 
@@ -308,12 +322,9 @@ def _read_audio_bytes(resp) -> bytes:
 def _tts_mp3_bytes(client: OpenAI, model: str, voice: str, text: str, instructions: str) -> bytes:
     """
     Voice-only TTS. We prepend instructions into the input in a lightweight way.
-    (The model reads exactly what you paste; instructions are guidance.)
     """
-    # Keep the guidance short and consistent
     guided_input = f"[Delivery guidance: {instructions.strip()}]\n\n{text}"
 
-    # SDK-safe response format handling
     try:
         resp = client.audio.speech.create(
             model=model,
@@ -337,6 +348,25 @@ def _mp3_to_wav_master(mp3_in: str, wav_out: str, sr: int) -> Tuple[bool, str]:
     cmd = [
         ffmpeg, "-y",
         "-i", mp3_in,
+        "-ac", "2",
+        "-ar", str(sr),
+        "-c:a", "pcm_s16le",
+        wav_out,
+    ]
+    code, out = _run(cmd)
+    return (code == 0), out
+
+
+def _pad_wav_tail(wav_in: str, wav_out: str, pad_seconds: float, sr: int) -> Tuple[bool, str]:
+    """
+    Add a short silence tail to prevent end-of-segment cutoffs after loudnorm + MP3 encoding.
+    Uses tpad to append a fixed duration of silence.
+    """
+    ffmpeg = _ffmpeg_path()
+    cmd = [
+        ffmpeg, "-y",
+        "-i", wav_in,
+        "-af", f"tpad=stop_mode=add:stop_duration={pad_seconds}",
         "-ac", "2",
         "-ar", str(sr),
         "-c:a", "pcm_s16le",
@@ -376,7 +406,7 @@ def _loudnorm_wav(wav_in: str, wav_out: str, target_lufs_i: int, true_peak_db: f
     offset = _pick("target_offset")
 
     if not all([measured_I, measured_TP, measured_LRA, measured_thresh, offset]):
-        # Sometimes ffmpeg prints json but parsing fails due to formatting; fall back to 1-pass
+        # Fall back to 1-pass
         cmd_fallback = [
             ffmpeg, "-y",
             "-i", wav_in,
@@ -477,8 +507,11 @@ def _build_hq_voice_only(
     status = st.empty()
 
     per_segment_mp3: Dict[str, bytes] = {}
-    per_segment_wav_master: Dict[str, bytes] = {}  # keep in zip for true HQ if you want
+    per_segment_wav_master: Dict[str, bytes] = {}
     norm_wavs_for_full: List[str] = []
+
+    # Tail padding to prevent cutoffs (tune 0.20–0.50 if desired)
+    TAIL_PAD_SECONDS = 0.35
 
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -502,7 +535,7 @@ def _build_hq_voice_only(
                 with open(raw_mp3_path, "wb") as f:
                     f.write(mp3_bytes)
 
-                # 2) Decode to WAV master (consistent SR)
+                # 2) Decode to WAV master
                 wav_master = os.path.join(td, f"{slug}_master.wav")
                 ok, out = _mp3_to_wav_master(raw_mp3_path, wav_master, sr)
                 if not ok:
@@ -513,9 +546,20 @@ def _build_hq_voice_only(
                     st.error(f"Audio decode failed on {slug}. See log.")
                     return
 
+                # 2.5) Add a short silence tail BEFORE loudnorm/MP3 encode (prevents end cutoffs)
+                wav_padded = os.path.join(td, f"{slug}_padded.wav")
+                ok, out = _pad_wav_tail(wav_master, wav_padded, TAIL_PAD_SECONDS, sr)
+                if not ok:
+                    log.append(f"[ERROR] {slug}: tail-pad failed\n{out}")
+                    st.session_state.last_build_log = "\n".join(log)
+                    progress.empty()
+                    status.empty()
+                    st.error(f"Tail padding failed on {slug}. See log.")
+                    return
+
                 # 3) Loudness normalize to WAV
                 wav_norm = os.path.join(td, f"{slug}_norm.wav")
-                ok, out = _loudnorm_wav(wav_master, wav_norm, target_lufs_i, true_peak_db, sr)
+                ok, out = _loudnorm_wav(wav_padded, wav_norm, target_lufs_i, true_peak_db, sr)
                 if not ok:
                     log.append(f"[ERROR] {slug}: loudnorm failed\n{out}")
                     st.session_state.last_build_log = "\n".join(log)
@@ -524,7 +568,7 @@ def _build_hq_voice_only(
                     st.error(f"Loudness normalization failed on {slug}. See log.")
                     return
 
-                # 4) Encode final MP3 (single encode after normalization)
+                # 4) Encode final MP3
                 out_mp3_path = os.path.join(td, f"{slug}.mp3")
                 ok, out = _wav_to_mp3(wav_norm, out_mp3_path, mp3_bitrate)
                 if not ok:
@@ -594,7 +638,7 @@ def _build_hq_voice_only(
                 for slug, b in per_segment_mp3.items():
                     z.writestr(f"audio/mp3/{slug}.mp3", b)
 
-                # Optional: normalized WAV masters for maximum quality
+                # Normalized WAV masters
                 for slug, b in per_segment_wav_master.items():
                     z.writestr(f"audio/wav_norm/{slug}.wav", b)
 
@@ -614,20 +658,6 @@ def _build_hq_voice_only(
 
     finally:
         st.session_state.last_build_log = "\n".join(log)
-
-
-# Run build on click (use local variable from Part 2)
-if "build_clicked" in globals() and build_clicked:
-    _build_hq_voice_only(
-        api_key=api_key,
-        model=tts_model,
-        voice_name=voice,
-        instructions=tts_instructions,
-        mp3_bitrate=mp3_bitrate,
-        sr=int(sample_rate),
-        target_lufs_i=int(target_lufs),
-        true_peak_db=float(true_peak),
-    )
 
 # ============================
 # PART 4/4 — Downloads (ZIP + Full Episode MP3)
