@@ -267,9 +267,13 @@ with right:
     )
 
 # ============================
-# PART 3/4 — HQ Audio Pipeline (Onyx → WAV master → Tail-pad → Loudness normalize → MP3 320k)
+# PART 3/4 — HQ Audio Pipeline (Cloud-robust tail pad)
 # COPY/PASTE THIS ENTIRE PART 3 BLOCK
-# (This includes the missing build trigger at the bottom.)
+#
+# CHANGE SUMMARY:
+# - Replaced the tpad-based tail padding (often missing on Streamlit Cloud FFmpeg)
+#   with a concat-based method using anullsrc + concat (much more broadly supported).
+# - Includes the missing build trigger at the bottom (button will work).
 # ============================
 
 def _collect_segments() -> List[Tuple[str, str]]:
@@ -359,17 +363,43 @@ def _mp3_to_wav_master(mp3_in: str, wav_out: str, sr: int) -> Tuple[bool, str]:
 
 def _pad_wav_tail(wav_in: str, wav_out: str, pad_seconds: float, sr: int) -> Tuple[bool, str]:
     """
-    Add a short silence tail to prevent end-of-segment cutoffs after loudnorm + MP3 encoding.
-    Uses tpad to append a fixed duration of silence.
+    Cloud-robust tail padding.
+
+    Streamlit Cloud often ships an FFmpeg build that lacks the 'tpad' filter.
+    This method instead appends silence by concatenating:
+      [original audio] + [generated silence]
+    using 'anullsrc' + 'concat', which is supported far more broadly.
+
+    Output is PCM WAV, stereo, sr.
     """
     ffmpeg = _ffmpeg_path()
+
+    # Ensure pad_seconds is a reasonable positive value
+    try:
+        pad_s = float(pad_seconds)
+    except Exception:
+        pad_s = 0.35
+    if pad_s <= 0:
+        pad_s = 0.20
+
+    # filter_complex:
+    #  - Take input audio as [a0]
+    #  - Generate silence as [a1] with matching sr & stereo for pad duration
+    #  - Concatenate them into [a]
+    fc = (
+        f"[0:a]aformat=sample_fmts=s16:channel_layouts=stereo,aresample={sr}[a0];"
+        f"anullsrc=r={sr}:cl=stereo:d={pad_s}[a1];"
+        f"[a0][a1]concat=n=2:v=0:a=1[a]"
+    )
+
     cmd = [
         ffmpeg, "-y",
         "-i", wav_in,
-        "-af", f"tpad=stop_mode=add:stop_duration={pad_seconds}",
+        "-filter_complex", fc,
+        "-map", "[a]",
+        "-c:a", "pcm_s16le",
         "-ac", "2",
         "-ar", str(sr),
-        "-c:a", "pcm_s16le",
         wav_out,
     ]
     code, out = _run(cmd)
@@ -541,7 +571,7 @@ def _build_hq_voice_only(
                     st.error(f"Audio decode failed on {slug}. See log.")
                     return
 
-                # 2.5) Tail-pad BEFORE loudnorm + MP3 encode
+                # 2.5) Tail-pad BEFORE loudnorm + MP3 encode (cloud-robust)
                 wav_padded = os.path.join(td, f"{slug}_padded.wav")
                 ok, out = _pad_wav_tail(wav_master, wav_padded, TAIL_PAD_SECONDS, sr)
                 if not ok:
@@ -653,8 +683,7 @@ def _build_hq_voice_only(
 
 
 # ----------------------------
-# ✅ BUILD TRIGGER (THIS WAS MISSING)
-# Must be AFTER build_clicked is defined (Part 2) and BEFORE Part 4 downloads
+# ✅ BUILD TRIGGER (must be after build_clicked exists in Part 2)
 # ----------------------------
 if build_clicked:
     _build_hq_voice_only(
