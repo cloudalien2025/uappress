@@ -268,7 +268,8 @@ with right:
 
 # ============================
 # PART 3/4 — HQ Audio Pipeline (Onyx → WAV master → Tail-pad → Loudness normalize → MP3 320k)
-# Replace your existing Part 3/4 block with this entire block
+# COPY/PASTE THIS ENTIRE PART 3 BLOCK
+# (This includes the missing build trigger at the bottom.)
 # ============================
 
 def _collect_segments() -> List[Tuple[str, str]]:
@@ -280,13 +281,12 @@ def _collect_segments() -> List[Tuple[str, str]]:
         s = (s or "").strip()
         if not s:
             return s
-        # If it already ends with punctuation, leave it.
         if re.search(r"[.!?…]\s*$", s):
             return s
-        # Add a period to encourage a natural stop.
         return s + "."
 
     segs: List[Tuple[str, str]] = []
+
     intro = _ensure_terminal_punct(st.session_state.intro_text)
     if intro:
         segs.append(("intro", intro))
@@ -383,7 +383,6 @@ def _loudnorm_wav(wav_in: str, wav_out: str, target_lufs_i: int, true_peak_db: f
     """
     ffmpeg = _ffmpeg_path()
 
-    # Pass 1: measure
     cmd1 = [
         ffmpeg, "-y",
         "-i", wav_in,
@@ -394,7 +393,6 @@ def _loudnorm_wav(wav_in: str, wav_out: str, target_lufs_i: int, true_peak_db: f
     if code1 != 0:
         return False, out1
 
-    # Extract JSON values (simple regex; avoid adding deps)
     def _pick(key: str) -> Optional[str]:
         m = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]+)"', out1)
         return m.group(1) if m else None
@@ -406,7 +404,6 @@ def _loudnorm_wav(wav_in: str, wav_out: str, target_lufs_i: int, true_peak_db: f
     offset = _pick("target_offset")
 
     if not all([measured_I, measured_TP, measured_LRA, measured_thresh, offset]):
-        # Fall back to 1-pass
         cmd_fallback = [
             ffmpeg, "-y",
             "-i", wav_in,
@@ -419,7 +416,6 @@ def _loudnorm_wav(wav_in: str, wav_out: str, target_lufs_i: int, true_peak_db: f
         codef, outf = _run(cmd_fallback)
         return (codef == 0), outf
 
-    # Pass 2: apply measured values
     af = (
         f"loudnorm=I={target_lufs_i}:TP={true_peak_db}:LRA=11:"
         f"measured_I={measured_I}:measured_TP={measured_TP}:measured_LRA={measured_LRA}:"
@@ -510,7 +506,6 @@ def _build_hq_voice_only(
     per_segment_wav_master: Dict[str, bytes] = {}
     norm_wavs_for_full: List[str] = []
 
-    # Tail padding to prevent cutoffs (tune 0.20–0.50 if desired)
     TAIL_PAD_SECONDS = 0.35
 
     try:
@@ -546,7 +541,7 @@ def _build_hq_voice_only(
                     st.error(f"Audio decode failed on {slug}. See log.")
                     return
 
-                # 2.5) Add a short silence tail BEFORE loudnorm/MP3 encode (prevents end cutoffs)
+                # 2.5) Tail-pad BEFORE loudnorm + MP3 encode
                 wav_padded = os.path.join(td, f"{slug}_padded.wav")
                 ok, out = _pad_wav_tail(wav_master, wav_padded, TAIL_PAD_SECONDS, sr)
                 if not ok:
@@ -590,7 +585,7 @@ def _build_hq_voice_only(
                 log.append(f"[OK] {slug}.mp3")
                 progress.progress(min(1.0, idx / total))
 
-            # 5) Full episode from normalized WAVs -> normalize again lightly -> MP3
+            # 5) Full episode from normalized WAVs -> normalize again -> MP3
             status.write("Building full episode…")
             full_wav = os.path.join(td, "full_episode.wav")
             ok, out = _concat_wavs(norm_wavs_for_full, full_wav)
@@ -625,20 +620,17 @@ def _build_hq_voice_only(
             with open(full_mp3_path, "rb") as f:
                 full_mp3_bytes = f.read()
 
-            # 6) ZIP bundle: scripts + segment MP3s (+ optional normalized WAV masters)
+            # 6) ZIP bundle
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                # Scripts
                 z.writestr("scripts/intro.txt", st.session_state.intro_text or "")
                 for i, ch in enumerate(st.session_state.chapters, start=1):
                     z.writestr(f"scripts/chapter_{i:02d}.txt", ch.get("text") or "")
                 z.writestr("scripts/outro.txt", st.session_state.outro_text or "")
 
-                # Audio MP3
                 for slug, b in per_segment_mp3.items():
                     z.writestr(f"audio/mp3/{slug}.mp3", b)
 
-                # Normalized WAV masters
                 for slug, b in per_segment_wav_master.items():
                     z.writestr(f"audio/wav_norm/{slug}.wav", b)
 
@@ -653,11 +645,28 @@ def _build_hq_voice_only(
 
             progress.empty()
             status.empty()
-            log.append(f"[OK] full_episode.mp3")
+            log.append("[OK] full_episode.mp3")
             st.success("Done! Download below.")
 
     finally:
         st.session_state.last_build_log = "\n".join(log)
+
+
+# ----------------------------
+# ✅ BUILD TRIGGER (THIS WAS MISSING)
+# Must be AFTER build_clicked is defined (Part 2) and BEFORE Part 4 downloads
+# ----------------------------
+if build_clicked:
+    _build_hq_voice_only(
+        api_key=api_key,
+        model=tts_model,
+        voice_name=voice,
+        instructions=tts_instructions,
+        mp3_bitrate=mp3_bitrate,
+        sr=int(sample_rate),
+        target_lufs_i=int(target_lufs),
+        true_peak_db=float(true_peak),
+    )
 
 # ============================
 # PART 4/4 — Downloads (ZIP + Full Episode MP3)
