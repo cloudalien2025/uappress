@@ -254,7 +254,16 @@ with right:
 
     st.markdown("---")
     st.markdown("#### Create Audio")
-    build_clicked = st.button("Generate HQ Audio + Export", type="primary", use_container_width=True)
+
+    # --- FIX: use a persistent session flag instead of relying on a 1-frame button bool ---
+    # Note: _ensure_state() should initialize st.session_state.build_requested = False
+    # If it doesn't yet, Part 1/4 should add that (tiny change).
+    if st.button("Generate HQ Audio + Export", type="primary", use_container_width=True):
+        st.session_state.build_requested = True
+        # Optional: clear log so you can tell a new build was requested
+        st.session_state.last_build_log = ""
+        st.rerun()
+    # -----------------------------------------------------------------------------------
 
     st.markdown("---")
     st.markdown("#### Last build log")
@@ -267,13 +276,19 @@ with right:
     )
 
 # ============================
-# PART 3/4 — HQ Audio Pipeline (Cloud-robust tail pad)
+# PART 3/4 — HQ Audio Pipeline (Cloud-robust tail pad + RERUN-PROOF BUILD TRIGGER)
 # COPY/PASTE THIS ENTIRE PART 3 BLOCK
 #
-# CHANGE SUMMARY:
-# - Replaced the tpad-based tail padding (often missing on Streamlit Cloud FFmpeg)
-#   with a concat-based method using anullsrc + concat (much more broadly supported).
-# - Includes the missing build trigger at the bottom (button will work).
+# FIXES INCLUDED:
+# 1) ✅ Rerun-proof build trigger using st.session_state.build_requested (NOT build_clicked)
+# 2) ✅ "BUILD STARTED" log line so you can prove the build actually fired
+# 3) ✅ Clears build_requested immediately to prevent accidental double-builds
+# 4) ✅ Adds full_episode.mp3 into the ZIP bundle (optional-but-smart)
+#
+# IMPORTANT:
+# - Part 2/4 now sets st.session_state.build_requested = True on button click.
+# - Part 1/4 (_ensure_state) should initialize:
+#     if "build_requested" not in st.session_state: st.session_state.build_requested = False
 # ============================
 
 def _collect_segments() -> List[Tuple[str, str]]:
@@ -382,10 +397,6 @@ def _pad_wav_tail(wav_in: str, wav_out: str, pad_seconds: float, sr: int) -> Tup
     if pad_s <= 0:
         pad_s = 0.20
 
-    # filter_complex:
-    #  - Take input audio as [a0]
-    #  - Generate silence as [a1] with matching sr & stereo for pad duration
-    #  - Concatenate them into [a]
     fc = (
         f"[0:a]aformat=sample_fmts=s16:channel_layouts=stereo,aresample={sr}[a0];"
         f"anullsrc=r={sr}:cl=stereo:d={pad_s}[a1];"
@@ -515,7 +526,13 @@ def _build_hq_voice_only(
     true_peak_db: float,
 ) -> None:
     log: List[str] = []
-    st.session_state.last_build_log = ""
+
+    # ✅ Make the trigger rerun-proof: consume the request immediately
+    st.session_state.build_requested = False
+
+    # ✅ PROOF OF LIFE: if you don't see this, the build never fired
+    log.append("[BUILD] STARTED")
+    st.session_state.last_build_log = "\n".join(log)
 
     if not api_key.strip():
         st.error("OpenAI API key is required (set it in the sidebar).")
@@ -613,6 +630,7 @@ def _build_hq_voice_only(
                 norm_wavs_for_full.append(wav_norm)
 
                 log.append(f"[OK] {slug}.mp3")
+                st.session_state.last_build_log = "\n".join(log)
                 progress.progress(min(1.0, idx / total))
 
             # 5) Full episode from normalized WAVs -> normalize again -> MP3
@@ -664,6 +682,9 @@ def _build_hq_voice_only(
                 for slug, b in per_segment_wav_master.items():
                     z.writestr(f"audio/wav_norm/{slug}.wav", b)
 
+                # ✅ Include the full episode MP3 in the ZIP (handy for "one download does all")
+                z.writestr("audio/mp3/full_episode.mp3", full_mp3_bytes)
+
             zip_buf.seek(0)
 
             st.session_state.built = {
@@ -676,16 +697,21 @@ def _build_hq_voice_only(
             progress.empty()
             status.empty()
             log.append("[OK] full_episode.mp3")
+            log.append("[BUILD] COMPLETE")
+            st.session_state.last_build_log = "\n".join(log)
             st.success("Done! Download below.")
 
     finally:
+        # Always persist whatever log we have (even if exceptions happen)
         st.session_state.last_build_log = "\n".join(log)
 
 
 # ----------------------------
-# ✅ BUILD TRIGGER (must be after build_clicked exists in Part 2)
+# ✅ BUILD TRIGGER (RERUN-PROOF)
 # ----------------------------
-if build_clicked:
+# Part 2/4 sets st.session_state.build_requested = True and then st.rerun().
+# This will catch it reliably even if Streamlit reruns a bunch.
+if st.session_state.get("build_requested", False):
     _build_hq_voice_only(
         api_key=api_key,
         model=tts_model,
